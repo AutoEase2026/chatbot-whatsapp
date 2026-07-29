@@ -139,6 +139,15 @@ print(f"Cerebro: {PROVEEDOR} / {MODEL}")
 # se reenvia entero en cada llamada, asi que sin tope la cuenta crece sola.
 MAX_HISTORIAL = 20
 
+# gpt-oss-120b es un modelo de RAZONAMIENTO: antes de escribir la respuesta
+# visible "piensa" internamente, y ese pensamiento gasta el MISMO presupuesto
+# de max_tokens. Con 400 se quedaba sin espacio justo en el paso de recomendar
+# (el mas pesado del flujo): devolvia content vacio y WhatsApp rechazaba el
+# envio con "The parameter text.body is required".
+# Dos defensas: menos razonamiento y mas techo.
+MAX_TOKENS = 1000
+ESFUERZO = "low"   # low | medium | high. Valentina no necesita razonar hondo.
+
 SYSTEM_PROMPT = """
 Eres Valentina, asesora digital de seguros de vida de Ole. Atiendes por WhatsApp
 a personas de America Latina.
@@ -368,12 +377,12 @@ def recibir():
         # llamada y encarece cada mensaje sin aportar nada.
         del historial[:-MAX_HISTORIAL]
 
-        resp = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=400,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + historial,
-        )
-        reply = resp.choices[0].message.content
+        reply = pensar_respuesta(historial)
+        if not reply:
+            # Nunca dejar al prospecto en visto: mejor pedir que repita que
+            # quedarse callado a media conversacion.
+            reply = ("Perdon, se me trabo el sistema un momento 😅 "
+                     "Me lo repites por favor?")
         historial.append({"role": "assistant", "content": reply})
 
         enviar_whatsapp(remitente, reply)
@@ -385,9 +394,45 @@ def recibir():
 
 
 # ---------------------------------------------------------------------------
+# 3b) PENSAR LA RESPUESTA (con red de seguridad contra respuestas vacias)
+# ---------------------------------------------------------------------------
+def pensar_respuesta(historial):
+    """Devuelve el texto de Valentina, o None si Groq no logro producirlo.
+
+    Si el modelo se queda sin tokens razonando, content vuelve vacio. En ese
+    caso reintentamos UNA vez con el doble de techo antes de rendirnos.
+    """
+    mensajes = [{"role": "system", "content": SYSTEM_PROMPT}] + historial
+
+    for intento, techo in enumerate([MAX_TOKENS, MAX_TOKENS * 2], start=1):
+        r = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=techo,
+            messages=mensajes,
+            extra_body={"reasoning_effort": ESFUERZO},
+        )
+        eleccion = r.choices[0]
+        texto = (eleccion.message.content or "").strip()
+        if texto:
+            return texto
+        print(f"Respuesta vacia (intento {intento}/2): "
+              f"finish_reason={eleccion.finish_reason}, "
+              f"{r.usage.completion_tokens} tokens gastados razonando.")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 4) ENVIAR un mensaje de vuelta por WhatsApp (llamada a la Graph API de Meta)
 # ---------------------------------------------------------------------------
 def enviar_whatsapp(destino, texto):
+    # Meta rechaza un body vacio con "The parameter text.body is required".
+    # Ultima linea de defensa: aqui no deberia llegar nunca vacio.
+    texto = (texto or "").strip()
+    if not texto:
+        print("Se intento enviar un mensaje vacio a WhatsApp. Cancelado.")
+        return
+
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
