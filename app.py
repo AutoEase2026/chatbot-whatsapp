@@ -36,7 +36,9 @@ Flujo:
 """
 
 import os
+import re
 import requests
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request
 from openai import OpenAI
 
@@ -153,18 +155,31 @@ ESFUERZO = "low"   # low | medium | high. Valentina no necesita razonar hondo.
 ASESOR_NOMBRE = os.environ.get("ASESOR_NOMBRE", "Jorge Arroyo")
 ASESOR_CORTO = ASESOR_NOMBRE.split()[0]
 
-# Link de agendamiento de Cal.com. Es la UNICA via para fijar la hora:
-# Valentina no conoce la agenda del asesor, asi que si ella confirmara un
-# horario podria chocar con algo ya ocupado. Cal.com lee ocupado/libre en
-# tiempo real y solo ofrece huecos reales.
-# Cambialo desde el .env con  LINK_AGENDA=https://cal.com/loquesea
-LINK_AGENDA = os.environ.get("LINK_AGENDA")
-if not LINK_AGENDA:
+# ---------------------------------------------------------------------------
+# Cal.com — agenda real. Valentina ya no manda un link para que la persona
+# elija hora por su cuenta: el propio backend consulta los huecos libres del
+# asesor y le manda a la persona una LISTA de horarios reales de WhatsApp
+# (botones), y al tocar uno se agenda directo por API. Cal.com le manda la
+# confirmacion (y la notificacion) al dueno de la cuenta automaticamente.
+#
+# NOTA (2026-08-01): la cuenta de Cal.com sigue siendo la de Enrique Ampudia
+# (es la unica conectada a un Google Calendar real ahora mismo), pero
+# Valentina se sigue presentando como si trabajara con Jorge. Es solo para
+# PROBAR que el flujo de agendar-por-API funciona de punta a punta. Cuando
+# Jorge tenga su propia cuenta de Cal.com, cambia CALCOM_API_KEY y
+# CALCOM_EVENT_TYPE_ID en el .env (no hace falta tocar el prompt).
+CALCOM_API_KEY = os.environ.get("CALCOM_API_KEY", "")
+if not CALCOM_API_KEY:
     raise RuntimeError(
-        "Falta LINK_AGENDA en el archivo .env. Antes daba un default falso "
-        "(cal.com/jorge-arroyo/llamada, 404) que Valentina llegaba a mandar "
-        "a prospectos reales. Pon un link de Cal.com verificado, por ejemplo "
-        "LINK_AGENDA=https://cal.com/enrique-ampudia-knhfq7/30min")
+        "Falta CALCOM_API_KEY en el archivo .env. Sin ella Valentina no puede "
+        "leer la agenda ni agendar citas. Consiguela en "
+        "cal.com/settings/developer/api-keys")
+
+# Id del tipo de evento (el "30min" / Llamada de asesoria). Se obtuvo con
+# GET https://api.cal.com/v2/event-types usando la API key de arriba.
+CALCOM_EVENT_TYPE_ID = os.environ.get("CALCOM_EVENT_TYPE_ID", "6525721")
+CALCOM_TIMEZONE = os.environ.get("CALCOM_TIMEZONE", "America/Merida")
+CALCOM_BASE = "https://api.cal.com/v2"
 
 SYSTEM_PROMPT = """
 Eres Valentina. Trabajas con {ASESOR}, asesor de seguros. Atiendes por
@@ -229,31 +244,35 @@ No alargues el diagnostico para "entender mejor". Cuando tengas el tipo de
 seguro y esas tres respuestas, PASA A LA FASE 3.
 
 ## FASE 3 — CREAR EL COMPROMISO (AGENDAR LA CITA)
-Primero cierras en la conversacion, DESPUES mandas el link. En ese orden: si
-mandas el link antes de que la persona se comprometa, casi nadie lo abre.
+Ya no mandas ningun link. Tu misma consultas la agenda real de {ASESOR_CORTO}
+y el sistema le manda a la persona una lista de horarios de WhatsApp
+(botones): toca uno y queda agendado. Nunca inventes ni confirmes tu misma un
+horario con palabras ("{ASESOR_CORTO} te llama a las 5"): no conoces su
+agenda y podrias chocar con algo ya ocupado. Solo el sistema sabe que esta
+libre de verdad.
 
 1. Devuelve en una linea lo que entendiste.
 2. Propon la llamada con dos opciones. Nunca preguntes "te interesa?".
    "Perfecto, con eso {ASESOR_CORTO} ya puede prepararte algo concreto. Te
    parece si te llama hoy en la tarde, o prefieres manana en la manana?"
-3. Cuando diga cual prefiere, MANDA EL LINK:
-   "Genial. Aqui eliges la hora exacta que te acomode y te llega el
-   recordatorio: {LINK_AGENDA}"
-4. Cierra corto: "Cualquier duda mientras tanto, aqui estoy 😊"
+3. En cuanto la persona diga una preferencia (o si ya la habia dado antes,
+   como "agendame manana a las 3"), termina tu mensaje con una frase corta y
+   pon la marca [MOSTRAR_HORARIOS] SOLA en la ultima linea, tal cual, sin
+   nada mas alrededor. Ejemplo:
+   "Va, dejame checar que huecos tiene {ASESOR_CORTO} libres manana en la
+   tarde 😊
+   [MOSTRAR_HORARIOS]"
+   El sistema ve esa marca, consulta la agenda real y le manda a la persona
+   los horarios de verdad para que elija uno tocandolo. TU NUNCA escribas
+   horarios, fechas concretas ni ningun link a mano: solo pon la marca.
+4. Si la persona ya eligio un horario de la lista, el sistema ya se encargo
+   de pedirle su correo y de agendar la cita. Si ves en la conversacion algo
+   como "[Cita agendada ...]", no vuelvas a proponer la cita ni a pedir mas
+   datos: solo sigue la conversacion con naturalidad.
 
-EL LINK ES LA UNICA FORMA DE FIJAR LA HORA. Nunca confirmes tu misma un horario
-concreto ("{ASESOR_CORTO} te llama a las 5"): no conoces su agenda y podrias
-chocar con algo ya ocupado. El link muestra solo sus huecos reales.
-
-Si la persona ya dijo cuando quiere ("agendame manana a las 3", "en la tarde
-me va bien"), NO le vuelvas a preguntar la preferencia: ya te la dio. Pasa
-directo al link, validando lo que pidio.
-"Va, manana en la tarde. Aqui eliges la hora exacta y te llega el recordatorio:
-{LINK_AGENDA}"
-
-No pidas nombre, correo ni telefono: el link se los pide al agendar.
+No pidas nombre, correo ni telefono: eso ya lo maneja el sistema cuando la
+persona elige horario.
 Si dice que ya agendo, agradece y cierra. No pidas nada mas.
-Si no define preferencia, ofrece un rango concreto ("manana entre 10 y 12?").
 Si dice "despues te aviso": "Sin problema. Te escribo el lunes para retomar?"
 Un solo mensaje de reenganche si se enfria. Nunca insistas dos veces sin respuesta.
 
@@ -303,13 +322,25 @@ No argumentes ni expliques de mas. Valida en una linea y regresa a la cita.
 Datos de contacto, solo si los piden expresamente o quieren llamar ya:
 Jorge Arroyo +52 999 949 2999 · Enrique Ampudia +52 990 310 0732
 """.strip() \
-    .replace("{LINK_AGENDA}", LINK_AGENDA) \
     .replace("{ASESOR_CORTO_MAYUS}", ASESOR_CORTO.upper()) \
     .replace("{ASESOR_CORTO}", ASESOR_CORTO) \
     .replace("{ASESOR}", ASESOR_NOMBRE)
 
 # Memoria por persona (se borra al reiniciar; en produccion iria a una base de datos)
 historiales = {}
+
+# Horarios que se le mostraron a cada persona en su ultima lista, para poder
+# traducir el id del boton que toco ("slot_0") de vuelta a una hora real.
+horarios_mostrados = {}
+
+# Cuando alguien toca un horario, falta un ultimo dato que Cal.com exige y
+# que no tenemos: el correo. Aqui se guarda "en espera de correo" mientras
+# llega la siguiente respuesta de esa persona.
+en_espera_de_correo = {}
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DIAS_ES = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
+DIAS_ES_CORTO = ["Lun", "Mar", "Mie", "Jue", "Vie", "Sab", "Dom"]
 
 app = Flask(__name__)
 
@@ -345,9 +376,24 @@ def recibir():
 
         msg = mensajes[0]
         remitente = msg["from"]                       # numero de la persona
+
+        # Caso 1: tocaron un horario de la lista que le mandamos. No pasa
+        # por el modelo: es un evento estructurado, se maneja directo.
+        if msg.get("type") == "interactive" and \
+                msg.get("interactive", {}).get("type") == "list_reply":
+            id_boton = msg["interactive"]["list_reply"]["id"]
+            manejar_seleccion_horario(remitente, id_boton, value)
+            return "ok", 200
+
         texto = msg.get("text", {}).get("body", "")   # el texto que escribio
 
-        # Pensar la respuesta con memoria por persona
+        # Caso 2: le acabamos de pedir el correo para cerrar el agendado.
+        # Tampoco pasa por el modelo: es el ultimo paso de un flujo ya en curso.
+        if remitente in en_espera_de_correo:
+            manejar_correo(remitente, texto)
+            return "ok", 200
+
+        # Caso 3: conversacion normal, la lleva el modelo.
         historial = historiales.setdefault(remitente, [])
         historial.append({"role": "user", "content": texto})
         # Solo se mandan los ultimos turnos: lo viejo se reenvia en cada
@@ -360,9 +406,20 @@ def recibir():
             # quedarse callado a media conversacion.
             reply = ("Perdon, se me trabo el sistema un momento 😅 "
                      "Me lo repites por favor?")
-        historial.append({"role": "assistant", "content": reply})
 
-        enviar_whatsapp(remitente, reply)
+        # Si el modelo decidio que es momento de agendar, la marca viene
+        # pegada a su mensaje: se manda el texto (si trae algo) y luego la
+        # lista de horarios reales, en vez de la marca cruda.
+        marca = re.search(r"\[\s*MOSTRAR_HORARIOS\s*\]", reply, re.IGNORECASE)
+        if marca:
+            texto_previo = (reply[:marca.start()] + reply[marca.end():]).strip()
+            historial.append({"role": "assistant", "content": reply})
+            if texto_previo:
+                enviar_whatsapp(remitente, texto_previo)
+            mandar_lista_horarios(remitente)
+        else:
+            historial.append({"role": "assistant", "content": reply})
+            enviar_whatsapp(remitente, reply)
     except Exception as e:
         print("Error procesando el mensaje:", e)
 
@@ -400,8 +457,19 @@ def pensar_respuesta(historial):
 
 
 # ---------------------------------------------------------------------------
-# 4) ENVIAR un mensaje de vuelta por WhatsApp (llamada a la Graph API de Meta)
+# 4) ENVIAR mensajes de vuelta por WhatsApp (llamadas a la Graph API de Meta)
 # ---------------------------------------------------------------------------
+def _post_whatsapp(payload):
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=20)
+    if r.status_code >= 400:
+        print("Error al enviar a WhatsApp:", r.status_code, r.text)
+    return r
+
+
 def enviar_whatsapp(destino, texto):
     # Meta rechaza un body vacio con "The parameter text.body is required".
     # Ultima linea de defensa: aqui no deberia llegar nunca vacio.
@@ -409,25 +477,206 @@ def enviar_whatsapp(destino, texto):
     if not texto:
         print("Se intento enviar un mensaje vacio a WhatsApp. Cancelado.")
         return
-
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
+    _post_whatsapp({
         "messaging_product": "whatsapp",
         "to": destino,
         "type": "text",
         "text": {"body": texto},
+    })
+
+
+def enviar_lista_whatsapp(destino, cuerpo, boton, filas):
+    """filas: lista de dicts {"id", "title", "description"} (maximo 10)."""
+    _post_whatsapp({
+        "messaging_product": "whatsapp",
+        "to": destino,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": cuerpo},
+            "action": {
+                "button": boton,
+                "sections": [{"title": "Horarios disponibles", "rows": filas}],
+            },
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# 5) CAL.COM — consultar horarios reales y agendar por API
+# ---------------------------------------------------------------------------
+def _calcom_headers(version):
+    return {
+        "Authorization": f"Bearer {CALCOM_API_KEY}",
+        "cal-api-version": version,
+        "Content-Type": "application/json",
     }
-    r = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=20)
-    if r.status_code >= 400:
-        print("Error al enviar a WhatsApp:", r.status_code, r.text)
+
+
+def obtener_horarios_disponibles(cuantos=3, dias_adelante=14):
+    """Devuelve hasta `cuantos` horarios libres reales (ISO con offset local),
+    los mas proximos primero."""
+    ahora = datetime.now(timezone.utc)
+    inicio = ahora.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    fin = (ahora + timedelta(days=dias_adelante)).strftime("%Y-%m-%dT23:59:59.000Z")
+    r = requests.get(
+        f"{CALCOM_BASE}/slots",
+        headers=_calcom_headers("2024-09-04"),
+        params={
+            "eventTypeId": CALCOM_EVENT_TYPE_ID,
+            "start": inicio,
+            "end": fin,
+            "timeZone": CALCOM_TIMEZONE,
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    dias = r.json().get("data", {})
+    horarios = []
+    for fecha in sorted(dias):
+        for slot in dias[fecha]:
+            horarios.append(slot["start"])
+            if len(horarios) >= cuantos:
+                return horarios
+    return horarios
+
+
+def formatear_slot(iso_str):
+    """Version corta para el titulo del boton (limite de WhatsApp: 24 caracteres)."""
+    dt = datetime.fromisoformat(iso_str)
+    hora12 = dt.hour % 12 or 12
+    ampm = "a.m." if dt.hour < 12 else "p.m."
+    return f"{DIAS_ES_CORTO[dt.weekday()]} {dt.day} {hora12}:{dt.minute:02d} {ampm}"
+
+
+def formatear_slot_largo(iso_str):
+    """Version legible para texto normal, ej. 'jueves 7 de agosto a las 9:00 a.m.'"""
+    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+             "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    dt = datetime.fromisoformat(iso_str)
+    hora12 = dt.hour % 12 or 12
+    ampm = "a.m." if dt.hour < 12 else "p.m."
+    return (f"{DIAS_ES[dt.weekday()]} {dt.day} de {meses[dt.month - 1]} "
+            f"a las {hora12}:{dt.minute:02d} {ampm}")
+
+
+def mandar_lista_horarios(remitente):
+    try:
+        horarios = obtener_horarios_disponibles(cuantos=3)
+    except Exception as e:
+        print("Error consultando horarios en Cal.com:", e)
+        enviar_whatsapp(remitente,
+            "Se me trabo revisando la agenda, dame un momento y seguimos 😅")
+        return
+
+    if not horarios:
+        enviar_whatsapp(remitente,
+            f"Por ahora no veo huecos libres en los proximos dias, dejame "
+            f"checar con {ASESOR_CORTO} y te aviso 🙏")
+        return
+
+    horarios_mostrados[remitente] = horarios
+    filas = [
+        {
+            "id": f"slot_{i}",
+            "title": formatear_slot(h),
+            "description": formatear_slot_largo(h).capitalize(),
+        }
+        for i, h in enumerate(horarios)
+    ]
+    enviar_lista_whatsapp(
+        remitente,
+        f"Estos son los horarios que tiene libres {ASESOR_CORTO}. Cual te acomoda?",
+        "Ver horarios",
+        filas,
+    )
+
+
+def manejar_seleccion_horario(remitente, id_boton, value):
+    horarios = horarios_mostrados.get(remitente)
+    idx = None
+    if horarios and id_boton.startswith("slot_"):
+        try:
+            idx = int(id_boton.split("_", 1)[1])
+        except ValueError:
+            idx = None
+
+    if idx is None or idx >= len(horarios):
+        enviar_whatsapp(remitente,
+            "Ese horario ya no esta disponible 🙏 Dime y te muestro otros.")
+        return
+
+    nombre = None
+    try:
+        nombre = value["contacts"][0]["profile"]["name"]
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    en_espera_de_correo[remitente] = {
+        "start": horarios[idx],
+        "nombre": nombre or "Prospecto",
+    }
+    enviar_whatsapp(remitente,
+        f"Perfecto, {formatear_slot_largo(horarios[idx])}. Cual es tu correo "
+        f"para mandarte la confirmacion de la cita?")
+
+
+def crear_reserva_calcom(start_iso, nombre, correo, telefono):
+    dt = datetime.fromisoformat(start_iso)
+    start_utc = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    telefono_e164 = telefono if telefono.startswith("+") else f"+{telefono}"
+    payload = {
+        "start": start_utc,
+        "eventTypeId": int(CALCOM_EVENT_TYPE_ID),
+        "attendee": {
+            "name": nombre,
+            "email": correo,
+            "timeZone": CALCOM_TIMEZONE,
+            "phoneNumber": telefono_e164,
+        },
+        "location": {"type": "attendeePhone", "phone": telefono_e164},
+    }
+    r = requests.post(f"{CALCOM_BASE}/bookings",
+                       headers=_calcom_headers("2026-02-25"),
+                       json=payload, timeout=15)
+    return r.status_code < 400, r.text
+
+
+def manejar_correo(remitente, texto):
+    pendiente = en_espera_de_correo.get(remitente)
+    correo = (texto or "").strip()
+
+    if not EMAIL_RE.match(correo):
+        enviar_whatsapp(remitente,
+            "Ese correo no se ve valido 🤔 Me lo escribes de nuevo?")
+        return
+
+    ok, detalle = crear_reserva_calcom(
+        pendiente["start"], pendiente["nombre"], correo, remitente)
+
+    del en_espera_de_correo[remitente]
+    horarios_mostrados.pop(remitente, None)
+
+    if ok:
+        historiales.setdefault(remitente, []).append({
+            "role": "assistant",
+            "content": f"[Cita agendada para {formatear_slot_largo(pendiente['start'])} "
+                       f"con {ASESOR_NOMBRE}]",
+        })
+        enviar_whatsapp(remitente,
+            f"Listo! Quedo agendado {formatear_slot_largo(pendiente['start'])}. "
+            f"{ASESOR_CORTO} ya quedo notificado y te llega la confirmacion "
+            f"a {correo} 😊")
+    else:
+        print("Error creando reserva en Cal.com:", detalle)
+        enviar_whatsapp(remitente,
+            "Se me trabo agendando ese horario, puede que ya se haya "
+            "ocupado. Dime y te muestro otros horarios 🙏")
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot de WhatsApp (Meta Cloud API) — Valentina activa. Prompt V5."
+    return "Bot de WhatsApp (Meta Cloud API) — Valentina activa. Prompt V8."
 
 
 if __name__ == "__main__":
