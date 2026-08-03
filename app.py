@@ -331,7 +331,13 @@ historiales = {}
 
 # Horarios que se le mostraron a cada persona en su ultima lista, para poder
 # traducir el id del boton que toco ("slot_0") de vuelta a una hora real.
+# Formato: {remitente: {"slots": [iso, ...], "pagina": 0}}
 horarios_mostrados = {}
+
+# Cuantos horarios se muestran por tanda. La lista tambien lleva una fila
+# "Otro horario" que trae la siguiente tanda, para que nadie se quede sin
+# opcion que le acomode.
+SLOTS_POR_PAGINA = 5
 
 # Cuando alguien toca un horario, falta un ultimo dato que Cal.com exige y
 # que no tenemos: el correo. Aqui se guarda "en espera de correo" mientras
@@ -513,9 +519,11 @@ def _calcom_headers(version):
     }
 
 
-def obtener_horarios_disponibles(cuantos=3, dias_adelante=14):
-    """Devuelve hasta `cuantos` horarios libres reales (ISO con offset local),
-    los mas proximos primero."""
+def obtener_horarios_disponibles(cuantos=SLOTS_POR_PAGINA, saltar=0, dias_adelante=30):
+    """Devuelve `(horarios, hay_mas)`: hasta `cuantos` horarios libres reales
+    (ISO con offset local) empezando despues de los primeros `saltar`, y si
+    todavia quedan mas atras de esa tanda. Se pide un slot extra justo para
+    poder responder eso sin una segunda llamada a Cal.com."""
     ahora = datetime.now(timezone.utc)
     inicio = ahora.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     fin = (ahora + timedelta(days=dias_adelante)).strftime("%Y-%m-%dT23:59:59.000Z")
@@ -532,13 +540,16 @@ def obtener_horarios_disponibles(cuantos=3, dias_adelante=14):
     )
     r.raise_for_status()
     dias = r.json().get("data", {})
+    tope = saltar + cuantos + 1
     horarios = []
     for fecha in sorted(dias):
         for slot in dias[fecha]:
             horarios.append(slot["start"])
-            if len(horarios) >= cuantos:
-                return horarios
-    return horarios
+            if len(horarios) >= tope:
+                break
+        if len(horarios) >= tope:
+            break
+    return horarios[saltar:saltar + cuantos], len(horarios) > saltar + cuantos
 
 
 def formatear_slot(iso_str):
@@ -560,9 +571,13 @@ def formatear_slot_largo(iso_str):
             f"a las {hora12}:{dt.minute:02d} {ampm}")
 
 
-def mandar_lista_horarios(remitente):
+def mandar_lista_horarios(remitente, pagina=0):
+    """Manda una tanda de horarios. Si quedan mas, agrega una fila "Otro
+    horario" que trae la siguiente tanda, y asi hasta que la persona encuentre
+    uno que le acomode o se acaben."""
     try:
-        horarios = obtener_horarios_disponibles(cuantos=3)
+        horarios, hay_mas = obtener_horarios_disponibles(
+            saltar=pagina * SLOTS_POR_PAGINA)
     except Exception as e:
         print("Error consultando horarios en Cal.com:", e)
         enviar_whatsapp(remitente,
@@ -570,12 +585,21 @@ def mandar_lista_horarios(remitente):
         return
 
     if not horarios:
-        enviar_whatsapp(remitente,
-            f"Por ahora no veo huecos libres en los proximos dias, dejame "
-            f"checar con {ASESOR_CORTO} y te aviso 🙏")
+        if pagina > 0:
+            # Se acabo la agenda: mejor volver al principio que dejarla sin
+            # opciones despues de haber pedido "otro horario".
+            enviar_whatsapp(remitente,
+                f"Esos son todos los huecos que tiene libres {ASESOR_CORTO} por "
+                f"ahora 🙈 Te vuelvo a poner los primeros, y si ninguno te "
+                f"acomoda dime que dia te queda mejor y lo checo con el.")
+            mandar_lista_horarios(remitente, 0)
+        else:
+            enviar_whatsapp(remitente,
+                f"Por ahora no veo huecos libres en los proximos dias, dejame "
+                f"checar con {ASESOR_CORTO} y te aviso 🙏")
         return
 
-    horarios_mostrados[remitente] = horarios
+    horarios_mostrados[remitente] = {"slots": horarios, "pagina": pagina}
     filas = [
         {
             "id": f"slot_{i}",
@@ -584,16 +608,31 @@ def mandar_lista_horarios(remitente):
         }
         for i, h in enumerate(horarios)
     ]
-    enviar_lista_whatsapp(
-        remitente,
-        f"Estos son los horarios que tiene libres {ASESOR_CORTO}. Cual te acomoda?",
-        "Ver horarios",
-        filas,
-    )
+    if hay_mas:
+        filas.append({
+            "id": "mas_horarios",
+            "title": "Otro horario",
+            "description": "Ninguno me acomoda, ver mas opciones",
+        })
+
+    if pagina == 0:
+        cuerpo = (f"Estos son los horarios que tiene libres {ASESOR_CORTO}. "
+                  f"Cual te acomoda?")
+    else:
+        cuerpo = "Va, aqui tienes mas opciones. Cual te queda mejor?"
+
+    enviar_lista_whatsapp(remitente, cuerpo, "Ver horarios", filas)
 
 
 def manejar_seleccion_horario(remitente, id_boton, value):
-    horarios = horarios_mostrados.get(remitente)
+    estado = horarios_mostrados.get(remitente) or {}
+    horarios = estado.get("slots")
+
+    # Pidio ver mas: se le manda la siguiente tanda y no pasa nada mas.
+    if id_boton == "mas_horarios":
+        mandar_lista_horarios(remitente, estado.get("pagina", 0) + 1)
+        return
+
     idx = None
     if horarios and id_boton.startswith("slot_"):
         try:
