@@ -39,6 +39,7 @@ import os
 import re
 import requests
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from flask import Flask, request
 from openai import OpenAI
 
@@ -267,13 +268,18 @@ libre de verdad.
    elija tocando. Siempre puede regresar a los dias o pedir mas horarios, asi
    que TU nunca tienes que ofrecerle alternativas: no escribas horarios,
    fechas concretas ni ningun link a mano, solo pon la marca.
-4. Si la persona ya eligio un horario de la lista, el sistema ya se encargo
-   de pedirle su correo y de agendar la cita. Si ves en la conversacion algo
-   como "[Cita agendada ...]", no vuelvas a proponer la cita ni a pedir mas
-   datos: solo sigue la conversacion con naturalidad.
+4. Cuando la persona toca un horario, el sistema agenda solo, ahi mismo, sin
+   pedirle ningun dato mas, y le manda un boton por si despues necesita
+   cancelar. Si ves en la conversacion algo como "[Cita agendada ...]", no
+   vuelvas a proponer la cita ni a pedir datos: solo sigue con naturalidad.
+   Si ves "[Cita cancelada ...]", no la reganes ni insistas; si quiere otra
+   hora, vuelve a poner la marca [MOSTRAR_HORARIOS].
+5. Si te pide cancelar por texto, no digas que ya la cancelaste (tu no puedes):
+   dile que toque el boton de "Cancelar cita" que le mandamos, o pon la marca
+   [MOSTRAR_HORARIOS] si lo que quiere es cambiarla de hora.
 
-No pidas nombre, correo ni telefono: eso ya lo maneja el sistema cuando la
-persona elige horario.
+No pidas nombre, correo ni telefono: no hacen falta, la cita se cierra con lo
+que ya sabemos de WhatsApp.
 Si dice que ya agendo, agradece y cierra. No pidas nada mas.
 Si dice "despues te aviso": "Sin problema. Te escribo el lunes para retomar?"
 Un solo mensaje de reenganche si se enfria. Nunca insistas dos veces sin respuesta.
@@ -338,18 +344,21 @@ historiales = {}
 # "pagina_horas": 0} mientras eligen hora.
 horarios_mostrados = {}
 
+# Dias que la persona ya vio y descarto (entro al dia y toco "Otro dia").
+# Dejan de aparecer en la lista para no hacerla dar vueltas sobre lo mismo.
+# Los dias que nunca abrio SI siguen apareciendo. Formato: {remitente: {fecha}}
+dias_descartados = {}
+
 # WhatsApp permite maximo 10 filas por lista (sin importar en cuantas
 # secciones se partan), asi que las tandas dejan lugar a las filas de
 # navegacion: 9 dias + "Otras fechas", u 8 horas + "Mas tarde" + "Otro dia".
 DIAS_POR_PAGINA = 9
 HORAS_POR_PAGINA = 8
 
-# Cuando alguien toca un horario, falta un ultimo dato que Cal.com exige y
-# que no tenemos: el correo. Aqui se guarda "en espera de correo" mientras
-# llega la siguiente respuesta de esa persona.
-en_espera_de_correo = {}
+# Ultima cita agendada por persona, para poder cancelarla si toca el boton.
+# Formato: {remitente: {"uid": "abc123", "start": iso}}
+citas_agendadas = {}
 
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DIAS_ES = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
@@ -391,23 +400,22 @@ def recibir():
         msg = mensajes[0]
         remitente = msg["from"]                       # numero de la persona
 
-        # Caso 1: tocaron un horario de la lista que le mandamos. No pasa
+        # Caso 1: tocaron algo (un horario de la lista, o un boton). No pasa
         # por el modelo: es un evento estructurado, se maneja directo.
-        if msg.get("type") == "interactive" and \
-                msg.get("interactive", {}).get("type") == "list_reply":
-            id_boton = msg["interactive"]["list_reply"]["id"]
-            manejar_seleccion_horario(remitente, id_boton, value)
+        interactivo = msg.get("interactive") or {}
+        if msg.get("type") == "interactive":
+            respuesta = (interactivo.get("list_reply")
+                         or interactivo.get("button_reply") or {})
+            id_boton = respuesta.get("id", "")
+            if id_boton.startswith("cancelar"):
+                manejar_cancelacion(remitente, id_boton)
+            else:
+                manejar_seleccion_horario(remitente, id_boton, value)
             return "ok", 200
 
         texto = msg.get("text", {}).get("body", "")   # el texto que escribio
 
-        # Caso 2: le acabamos de pedir el correo para cerrar el agendado.
-        # Tampoco pasa por el modelo: es el ultimo paso de un flujo ya en curso.
-        if remitente in en_espera_de_correo:
-            manejar_correo(remitente, texto)
-            return "ok", 200
-
-        # Caso 3: conversacion normal, la lleva el modelo.
+        # Caso 2: conversacion normal, la lleva el modelo.
         historial = historiales.setdefault(remitente, [])
         historial.append({"role": "user", "content": texto})
         # Solo se mandan los ultimos turnos: lo viejo se reenvia en cada
@@ -517,6 +525,25 @@ def enviar_lista_whatsapp(destino, cuerpo, boton, filas, titulo="Horarios dispon
     })
 
 
+def enviar_botones_whatsapp(destino, cuerpo, botones):
+    """botones: lista de dicts {"id", "title"} (maximo 3, titulo <= 20)."""
+    _post_whatsapp({
+        "messaging_product": "whatsapp",
+        "to": destino,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": cuerpo},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                    for b in botones
+                ],
+            },
+        },
+    })
+
+
 # ---------------------------------------------------------------------------
 # 5) CAL.COM — consultar horarios reales y agendar por API
 # ---------------------------------------------------------------------------
@@ -596,12 +623,24 @@ def mandar_lista_dias(remitente, pagina=0):
             "Se me trabo revisando la agenda, dame un momento y seguimos 😅")
         return
 
-    fechas = list(agenda)
-    if not fechas:
+    if not agenda:
         enviar_whatsapp(remitente,
             f"Por ahora no veo huecos libres en los proximos dias, dejame "
             f"checar con {ASESOR_CORTO} y te aviso 🙏")
         return
+
+    descartados = dias_descartados.get(remitente, set())
+    fechas = [f for f in agenda if f not in descartados]
+    if not fechas:
+        # Ya le dio vuelta a todos los dias: se limpia el descarte y se
+        # empieza otra vez, mejor que dejarla con una lista vacia.
+        dias_descartados.pop(remitente, None)
+        fechas = list(agenda)
+        pagina = 0
+        enviar_whatsapp(remitente,
+            f"Ya vimos todos los dias que tiene libres {ASESOR_CORTO} 🙈 "
+            f"Te los pongo de nuevo, y si de plano ninguno te acomoda dime "
+            f"que dia y hora te quedarian mejor y lo checo con el.")
 
     # Si se pasaron del final (agenda mas corta que la ultima vez), se regresa
     # al principio en vez de dejar a la persona con una lista vacia.
@@ -699,7 +738,9 @@ def mandar_lista_horas(remitente, fecha, pagina=0):
 
 
 def mandar_lista_horarios(remitente):
-    """Entrada del flujo de agendado: siempre arranca por los dias."""
+    """Entrada del flujo de agendado: arranca por los dias y sin descartes,
+    porque es un intento nuevo (lo que descarto hace rato pudo cambiar)."""
+    dias_descartados.pop(remitente, None)
     mandar_lista_dias(remitente, 0)
 
 
@@ -709,6 +750,11 @@ def manejar_seleccion_horario(remitente, id_boton, value):
     estado = horarios_mostrados.get(remitente) or {}
 
     if id_boton == "otro_dia":
+        # Ya vio las horas de ese dia y ninguna le sirvio: se saca de la lista
+        # para que las siguientes fechas sean todas nuevas para ella.
+        fecha = estado.get("fecha")
+        if fecha:
+            dias_descartados.setdefault(remitente, set()).add(fecha)
         mandar_lista_dias(remitente, 0)
         return
 
@@ -749,13 +795,7 @@ def manejar_seleccion_horario(remitente, id_boton, value):
     except (KeyError, IndexError, TypeError):
         pass
 
-    en_espera_de_correo[remitente] = {
-        "start": horarios[idx],
-        "nombre": nombre or "Prospecto",
-    }
-    enviar_whatsapp(remitente,
-        f"Perfecto, {formatear_slot_largo(horarios[idx])} Cual es tu correo "
-        f"para mandarte la confirmacion de la cita?")
+    agendar(remitente, horarios[idx], nombre or "Prospecto")
 
 
 def _indice(id_boton):
@@ -777,6 +817,18 @@ def normalizar_telefono(wa_id):
     elif d.startswith("549") and len(d) == 13:    # Argentina movil (54 + 9 + 10)
         d = "54" + d[3:]
     return f"+{d}"
+
+
+def correo_de_whatsapp(telefono):
+    """Cal.com exige un correo para agendar, pero a la persona no se le pide:
+    ya la tenemos por WhatsApp y pedirlo costaba conversiones. Se arma uno
+    derivado del numero, siempre el mismo, que ademas sirve para volver a
+    encontrar sus citas en la API si se pierde el estado en memoria.
+    Se usa `example.com` porque esta reservado por la IANA (nadie puede ser
+    dueno de el, no hay riesgo de mandarle los datos a un extrano) y porque
+    Cal.com rechaza los dominios que no pueden recibir correo: dominios
+    inventados o `.invalid` truenan con `email_domain_cannot_receive_mail`."""
+    return f"wa{re.sub(r'\\D', '', telefono or '')}@example.com"
 
 
 def crear_reserva_calcom(start_iso, nombre, correo, telefono):
@@ -807,40 +859,138 @@ def crear_reserva_calcom(start_iso, nombre, correo, telefono):
     r = requests.post(f"{CALCOM_BASE}/bookings",
                        headers=_calcom_headers("2024-08-13"),
                        json=payload, timeout=15)
-    return r.status_code < 400, r.text
+    if r.status_code >= 400:
+        return False, None, r.text
+    uid = None
+    try:
+        uid = r.json()["data"]["uid"]
+    except (ValueError, KeyError, TypeError):
+        pass                       # la cita quedo; solo no podremos cancelarla
+    return True, uid, r.text
 
 
-def manejar_correo(remitente, texto):
-    pendiente = en_espera_de_correo.get(remitente)
-    correo = (texto or "").strip()
+def agendar(remitente, start_iso, nombre):
+    """Cierra la cita en cuanto toca el horario: no se le pide ningun dato
+    mas, todo lo que Cal.com necesita ya lo tenemos de WhatsApp."""
+    ok, uid, detalle = crear_reserva_calcom(
+        start_iso, nombre, correo_de_whatsapp(remitente), remitente)
 
-    if not EMAIL_RE.match(correo):
-        enviar_whatsapp(remitente,
-            "Ese correo no se ve valido 🤔 Me lo escribes de nuevo?")
-        return
-
-    ok, detalle = crear_reserva_calcom(
-        pendiente["start"], pendiente["nombre"], correo, remitente)
-
-    del en_espera_de_correo[remitente]
     horarios_mostrados.pop(remitente, None)
 
-    if ok:
-        historiales.setdefault(remitente, []).append({
-            "role": "assistant",
-            "content": f"[Cita agendada para {formatear_slot_largo(pendiente['start'])} "
-                       f"con {ASESOR_NOMBRE}]",
-        })
-        enviar_whatsapp(remitente,
-            f"Listo! Quedo agendado {formatear_slot_largo(pendiente['start'])} "
-            f"{ASESOR_CORTO} ya quedo notificado y te llega la confirmacion "
-            f"a {correo} 😊")
-    else:
+    if not ok:
         print("Error creando reserva en Cal.com:", detalle)
         enviar_whatsapp(remitente,
             "Uy, ese horario se acaba de ocupar 🙈 Estos son los dias que "
             "siguen libres:")
-        mandar_lista_horarios(remitente)
+        # Sin resetear los descartes: sigue siendo el mismo intento y los
+        # dias que ya rechazo le siguen sin servir.
+        mandar_lista_dias(remitente, 0)
+        return
+
+    dias_descartados.pop(remitente, None)
+    citas_agendadas[remitente] = {"uid": uid, "start": start_iso}
+    # Se le avisa al modelo para que no vuelva a proponer la cita.
+    historiales.setdefault(remitente, []).append({
+        "role": "assistant",
+        "content": f"[Cita agendada para {formatear_slot_largo(start_iso)} "
+                   f"con {ASESOR_NOMBRE}]",
+    })
+    enviar_whatsapp(remitente,
+        f"Listo! Quedo agendado {formatear_slot_largo(start_iso)} "
+        f"{ASESOR_CORTO} ya quedo notificado y te va a marcar a este mismo "
+        f"numero 😊")
+    enviar_botones_whatsapp(remitente,
+        "Si despues no puedes y necesitas cancelar, toca el boton. "
+        "Si no lo tocas, la cita queda en pie.",
+        [{"id": "cancelar_cita", "title": "Cancelar cita"}])
+
+
+def buscar_cita_agendada(remitente):
+    """Recupera la cita de la API cuando se perdio el estado en memoria
+    (pasa en cada redeploy de Render). La busca por el correo derivado del
+    numero, que siempre es el mismo para esa persona."""
+    try:
+        r = requests.get(f"{CALCOM_BASE}/bookings",
+                         headers=_calcom_headers("2024-08-13"),
+                         params={"attendeeEmail": correo_de_whatsapp(remitente),
+                                 "status": "upcoming",
+                                 "sortStart": "asc"},
+                         timeout=15)
+        r.raise_for_status()
+        reservas = r.json().get("data") or []
+    except Exception as e:
+        print("Error buscando la cita en Cal.com:", e)
+        return None
+    if not reservas:
+        return None
+    return {"uid": reservas[0].get("uid"),
+            "start": a_hora_local(reservas[0].get("start"))}
+
+
+def a_hora_local(iso_str):
+    """La API devuelve las horas en UTC ('...T15:00:00.000Z'); los horarios
+    que mostramos van en la zona del asesor. Sin esto la cita recuperada de
+    la API se le anunciaria a la persona con la hora corrida."""
+    if not iso_str:
+        return iso_str
+    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        return iso_str
+    return dt.astimezone(ZoneInfo(CALCOM_TIMEZONE)).isoformat()
+
+
+def cancelar_reserva_calcom(uid):
+    r = requests.post(f"{CALCOM_BASE}/bookings/{uid}/cancel",
+                      headers=_calcom_headers("2024-08-13"),
+                      json={"cancellationReason": "Cancelada por el prospecto "
+                                                  "desde WhatsApp"},
+                      timeout=15)
+    return r.status_code < 400, r.text
+
+
+def manejar_cancelacion(remitente, id_boton):
+    """Cancelar siempre pide una confirmacion: un toque por error no puede
+    tirar una cita ya ganada."""
+    if id_boton == "cancelar_no":
+        enviar_whatsapp(remitente,
+            "Perfecto, tu cita sigue en pie 😊 Ahi te marca "
+            f"{ASESOR_CORTO}.")
+        return
+
+    cita = citas_agendadas.get(remitente) or buscar_cita_agendada(remitente)
+    if not cita or not cita.get("uid"):
+        enviar_whatsapp(remitente,
+            "No encuentro ninguna cita activa a tu nombre 🤔 Si quieres "
+            "agendar una, dime y te paso los horarios.")
+        return
+
+    if id_boton == "cancelar_cita":
+        citas_agendadas[remitente] = cita
+        enviar_botones_whatsapp(remitente,
+            f"Seguro que quieres cancelar tu cita del "
+            f"{formatear_slot_largo(cita['start'])}?",
+            [{"id": "cancelar_si", "title": "Si, cancelar"},
+             {"id": "cancelar_no", "title": "No, dejarla"}])
+        return
+
+    # cancelar_si
+    ok, detalle = cancelar_reserva_calcom(cita["uid"])
+    if not ok:
+        print("Error cancelando en Cal.com:", detalle)
+        enviar_whatsapp(remitente,
+            "Se me trabo cancelando 😅 Dame un momento y lo intento de nuevo.")
+        return
+
+    citas_agendadas.pop(remitente, None)
+    historiales.setdefault(remitente, []).append({
+        "role": "assistant",
+        "content": f"[Cita cancelada por la persona: "
+                   f"{formatear_slot_largo(cita['start'])}]",
+    })
+    enviar_whatsapp(remitente,
+        f"Listo, cancele tu cita del {formatear_slot_largo(cita['start'])} y "
+        f"{ASESOR_CORTO} ya quedo enterado. Si luego quieres otra hora, "
+        f"dime y te paso los horarios 😊")
 
 
 @app.route("/", methods=["GET"])
