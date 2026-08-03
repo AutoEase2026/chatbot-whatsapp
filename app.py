@@ -147,11 +147,11 @@ ESFUERZO = "low"   # low | medium | high. Valentina no necesita razonar hondo.
 
 # Asesor que Valentina presenta en la conversacion.
 # NOTA (2026-08-01): el asesor real es Jorge Arroyo, pero su Cal.com aun no
-# existe (el link viejo "jorge-arroyo/llamada" daba 404). Mientras tanto el
-# link de abajo (LINK_AGENDA) usa el Cal.com de Enrique Ampudia SOLO PARA
-# PROBAR que el flujo de agendamiento funciona end-to-end; el nombre que se
-# presenta sigue siendo Jorge. Cuando Jorge tenga su propio Cal.com, cambia
-# LINK_AGENDA en el .env (ASESOR_NOMBRE ya no necesitaria cambiar).
+# existe (el link viejo "jorge-arroyo/llamada" daba 404). Mientras tanto la
+# agenda que se consulta es la de Enrique Ampudia (ver CALCOM_API_KEY abajo)
+# SOLO PARA PROBAR que el flujo funciona end-to-end; el nombre que Valentina
+# presenta sigue siendo Jorge. Ya no existe ningun link ni variable
+# LINK_AGENDA: todo se agenda por API.
 ASESOR_NOMBRE = os.environ.get("ASESOR_NOMBRE", "Jorge Arroyo")
 ASESOR_CORTO = ASESOR_NOMBRE.split()[0]
 
@@ -252,15 +252,15 @@ agenda y podrias chocar con algo ya ocupado. Solo el sistema sabe que esta
 libre de verdad.
 
 1. Devuelve en una linea lo que entendiste.
-2. Propon la llamada con dos opciones. Nunca preguntes "te interesa?".
-   "Perfecto, con eso {ASESOR_CORTO} ya puede prepararte algo concreto. Te
-   parece si te llama hoy en la tarde, o prefieres manana en la manana?"
-3. En cuanto la persona diga una preferencia (o si ya la habia dado antes,
-   como "agendame manana a las 3"), termina tu mensaje con una frase corta y
-   pon la marca [MOSTRAR_HORARIOS] SOLA en la ultima linea, tal cual, sin
-   nada mas alrededor. Ejemplo:
-   "Va, dejame checar que huecos tiene {ASESOR_CORTO} libres manana en la
-   tarde 😊
+2. Propon la llamada SIN ofrecer horarios tu misma. Nunca preguntes
+   "te interesa?" ni "te parece hoy en la tarde o manana?": no sabes que
+   tiene libre y la lista que sale despues te contradice. Di algo como
+   "Perfecto, con eso {ASESOR_CORTO} ya puede prepararte algo concreto.
+   Dejame ver que horarios tiene libres 😊"
+3. En ese mismo mensaje, pon la marca [MOSTRAR_HORARIOS] SOLA en la ultima
+   linea, tal cual, sin nada mas alrededor. Ejemplo:
+   "Perfecto, con eso {ASESOR_CORTO} ya puede prepararte algo concreto.
+   Dejame ver que horarios tiene libres 😊
    [MOSTRAR_HORARIOS]"
    El sistema ve esa marca, consulta la agenda real y le manda a la persona
    los horarios de verdad para que elija uno tocandolo. TU NUNCA escribas
@@ -621,10 +621,29 @@ def manejar_seleccion_horario(remitente, id_boton, value):
         f"para mandarte la confirmacion de la cita?")
 
 
+def normalizar_telefono(wa_id):
+    """WhatsApp entrega el numero con el '1' viejo de movil (Mexico: 52 1 999...,
+    Argentina: 54 9 11...). Cal.com valida con libphonenumber y esos formatos
+    los rechaza con 'invalid_number', asi que hay que quitarles ese digito.
+    Devuelve el numero en E.164, ej. '+529991105167'."""
+    d = re.sub(r"\D", "", wa_id or "")
+    if d.startswith("521") and len(d) == 13:      # Mexico movil (52 + 1 + 10)
+        d = "52" + d[3:]
+    elif d.startswith("549") and len(d) == 13:    # Argentina movil (54 + 9 + 10)
+        d = "54" + d[3:]
+    return f"+{d}"
+
+
 def crear_reserva_calcom(start_iso, nombre, correo, telefono):
     dt = datetime.fromisoformat(start_iso)
     start_utc = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    telefono_e164 = telefono if telefono.startswith("+") else f"+{telefono}"
+    telefono_e164 = normalizar_telefono(telefono)
+    wa_id = re.sub(r"\D", "", telefono or "")
+    # Estas notas son lo que ve el asesor en su Google Calendar y en el correo
+    # de confirmacion: el numero para llamar y el link directo al chat.
+    notas = (f"Prospecto de WhatsApp: {telefono_e164}\n"
+             f"Abrir el chat: https://wa.me/{wa_id}\n"
+             f"Agendado automaticamente por Valentina (bot).")
     payload = {
         "start": start_utc,
         "eventTypeId": int(CALCOM_EVENT_TYPE_ID),
@@ -634,10 +653,14 @@ def crear_reserva_calcom(start_iso, nombre, correo, telefono):
             "timeZone": CALCOM_TIMEZONE,
             "phoneNumber": telefono_e164,
         },
+        # attendeePhone = el asesor llama a ESTE numero. Cal.com lo pone solo
+        # como "ubicacion" de la cita, no hay que llenarlo a mano.
         "location": {"type": "attendeePhone", "phone": telefono_e164},
+        "bookingFieldsResponses": {"notes": notas},
+        "metadata": {"whatsapp": wa_id[:50]},
     }
     r = requests.post(f"{CALCOM_BASE}/bookings",
-                       headers=_calcom_headers("2026-02-25"),
+                       headers=_calcom_headers("2024-08-13"),
                        json=payload, timeout=15)
     return r.status_code < 400, r.text
 
@@ -670,8 +693,9 @@ def manejar_correo(remitente, texto):
     else:
         print("Error creando reserva en Cal.com:", detalle)
         enviar_whatsapp(remitente,
-            "Se me trabo agendando ese horario, puede que ya se haya "
-            "ocupado. Dime y te muestro otros horarios 🙏")
+            "Uy, ese horario se acaba de ocupar 🙈 Estos son los que siguen "
+            "libres:")
+        mandar_lista_horarios(remitente)
 
 
 @app.route("/", methods=["GET"])
