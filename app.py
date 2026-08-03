@@ -256,15 +256,17 @@ libre de verdad.
    "te interesa?" ni "te parece hoy en la tarde o manana?": no sabes que
    tiene libre y la lista que sale despues te contradice. Di algo como
    "Perfecto, con eso {ASESOR_CORTO} ya puede prepararte algo concreto.
-   Dejame ver que horarios tiene libres 😊"
+   Dejame ver que dias tiene libres 😊"
 3. En ese mismo mensaje, pon la marca [MOSTRAR_HORARIOS] SOLA en la ultima
    linea, tal cual, sin nada mas alrededor. Ejemplo:
    "Perfecto, con eso {ASESOR_CORTO} ya puede prepararte algo concreto.
-   Dejame ver que horarios tiene libres 😊
+   Dejame ver que dias tiene libres 😊
    [MOSTRAR_HORARIOS]"
    El sistema ve esa marca, consulta la agenda real y le manda a la persona
-   los horarios de verdad para que elija uno tocandolo. TU NUNCA escribas
-   horarios, fechas concretas ni ningun link a mano: solo pon la marca.
+   primero los dias libres y, cuando toca uno, las horas de ese dia, para que
+   elija tocando. Siempre puede regresar a los dias o pedir mas horarios, asi
+   que TU nunca tienes que ofrecerle alternativas: no escribas horarios,
+   fechas concretas ni ningun link a mano, solo pon la marca.
 4. Si la persona ya eligio un horario de la lista, el sistema ya se encargo
    de pedirle su correo y de agendar la cita. Si ves en la conversacion algo
    como "[Cita agendada ...]", no vuelvas a proponer la cita ni a pedir mas
@@ -331,13 +333,16 @@ historiales = {}
 
 # Horarios que se le mostraron a cada persona en su ultima lista, para poder
 # traducir el id del boton que toco ("slot_0") de vuelta a una hora real.
-# Formato: {remitente: {"slots": [iso, ...], "pagina": 0}}
+# Formato: {"modo": "dias", "dias": [...], "pagina_dias": 0} mientras eligen
+# dia, y {"modo": "horas", "fecha": "2026-08-04", "slots": [...],
+# "pagina_horas": 0} mientras eligen hora.
 horarios_mostrados = {}
 
-# Cuantos horarios se muestran por tanda. La lista tambien lleva una fila
-# "Otro horario" que trae la siguiente tanda, para que nadie se quede sin
-# opcion que le acomode.
-SLOTS_POR_PAGINA = 5
+# WhatsApp permite maximo 10 filas por lista (sin importar en cuantas
+# secciones se partan), asi que las tandas dejan lugar a las filas de
+# navegacion: 9 dias + "Otras fechas", u 8 horas + "Mas tarde" + "Otro dia".
+DIAS_POR_PAGINA = 9
+HORAS_POR_PAGINA = 8
 
 # Cuando alguien toca un horario, falta un ultimo dato que Cal.com exige y
 # que no tenemos: el correo. Aqui se guarda "en espera de correo" mientras
@@ -346,7 +351,10 @@ en_espera_de_correo = {}
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DIAS_ES = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
-DIAS_ES_CORTO = ["Lun", "Mar", "Mie", "Jue", "Vie", "Sab", "Dom"]
+MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+         "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+MESES_CORTO = ["ene", "feb", "mar", "abr", "may", "jun",
+               "jul", "ago", "sep", "oct", "nov", "dic"]
 
 app = Flask(__name__)
 
@@ -491,8 +499,9 @@ def enviar_whatsapp(destino, texto):
     })
 
 
-def enviar_lista_whatsapp(destino, cuerpo, boton, filas):
-    """filas: lista de dicts {"id", "title", "description"} (maximo 10)."""
+def enviar_lista_whatsapp(destino, cuerpo, boton, filas, titulo="Horarios disponibles"):
+    """filas: lista de dicts {"id", "title", "description"} (maximo 10, es
+    limite de WhatsApp: no importa en cuantas secciones se partan)."""
     _post_whatsapp({
         "messaging_product": "whatsapp",
         "to": destino,
@@ -502,7 +511,7 @@ def enviar_lista_whatsapp(destino, cuerpo, boton, filas):
             "body": {"text": cuerpo},
             "action": {
                 "button": boton,
-                "sections": [{"title": "Horarios disponibles", "rows": filas}],
+                "sections": [{"title": titulo, "rows": filas}],
             },
         },
     })
@@ -519,11 +528,11 @@ def _calcom_headers(version):
     }
 
 
-def obtener_horarios_disponibles(cuantos=SLOTS_POR_PAGINA, saltar=0, dias_adelante=30):
-    """Devuelve `(horarios, hay_mas)`: hasta `cuantos` horarios libres reales
-    (ISO con offset local) empezando despues de los primeros `saltar`, y si
-    todavia quedan mas atras de esa tanda. Se pide un slot extra justo para
-    poder responder eso sin una segunda llamada a Cal.com."""
+def obtener_agenda(dias_adelante=30):
+    """Devuelve la agenda libre real agrupada por dia:
+    `{"2026-08-04": ["2026-08-04T09:00:00-05:00", ...], ...}`, en orden.
+    Se vuelve a consultar en cada paso a proposito: entre que la persona ve
+    los dias y toca una hora pudo ocuparse algo."""
     ahora = datetime.now(timezone.utc)
     inicio = ahora.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     fin = (ahora + timedelta(days=dias_adelante)).strftime("%Y-%m-%dT23:59:59.000Z")
@@ -540,109 +549,198 @@ def obtener_horarios_disponibles(cuantos=SLOTS_POR_PAGINA, saltar=0, dias_adelan
     )
     r.raise_for_status()
     dias = r.json().get("data", {})
-    tope = saltar + cuantos + 1
-    horarios = []
+    agenda = {}
     for fecha in sorted(dias):
-        for slot in dias[fecha]:
-            horarios.append(slot["start"])
-            if len(horarios) >= tope:
-                break
-        if len(horarios) >= tope:
-            break
-    return horarios[saltar:saltar + cuantos], len(horarios) > saltar + cuantos
+        horas = [s["start"] for s in dias[fecha]]
+        if horas:
+            agenda[fecha] = horas
+    return agenda
 
 
-def formatear_slot(iso_str):
-    """Version corta para el titulo del boton (limite de WhatsApp: 24 caracteres)."""
+def formatear_dia(fecha):
+    """Titulo corto de la fila del dia, ej. 'Martes 4 ago'.
+    WhatsApp corta los titulos en 24 caracteres."""
+    dt = datetime.fromisoformat(fecha)
+    return f"{DIAS_ES[dt.weekday()].capitalize()} {dt.day} {MESES_CORTO[dt.month - 1]}"
+
+
+def formatear_dia_largo(fecha):
+    """Ej. 'martes 4 de agosto'."""
+    dt = datetime.fromisoformat(fecha)
+    return f"{DIAS_ES[dt.weekday()]} {dt.day} de {MESES[dt.month - 1]}"
+
+
+def formatear_hora(iso_str):
+    """Solo la hora, ej. '9:00 a.m.' — el dia ya va en el texto del mensaje."""
     dt = datetime.fromisoformat(iso_str)
     hora12 = dt.hour % 12 or 12
     ampm = "a.m." if dt.hour < 12 else "p.m."
-    return f"{DIAS_ES_CORTO[dt.weekday()]} {dt.day} {hora12}:{dt.minute:02d} {ampm}"
+    return f"{hora12}:{dt.minute:02d} {ampm}"
 
 
 def formatear_slot_largo(iso_str):
     """Version legible para texto normal, ej. 'jueves 7 de agosto a las 9:00 a.m.'"""
-    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
-             "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
     dt = datetime.fromisoformat(iso_str)
-    hora12 = dt.hour % 12 or 12
-    ampm = "a.m." if dt.hour < 12 else "p.m."
-    return (f"{DIAS_ES[dt.weekday()]} {dt.day} de {meses[dt.month - 1]} "
-            f"a las {hora12}:{dt.minute:02d} {ampm}")
+    return (f"{DIAS_ES[dt.weekday()]} {dt.day} de {MESES[dt.month - 1]} "
+            f"a las {formatear_hora(iso_str)}")
 
 
-def mandar_lista_horarios(remitente, pagina=0):
-    """Manda una tanda de horarios. Si quedan mas, agrega una fila "Otro
-    horario" que trae la siguiente tanda, y asi hasta que la persona encuentre
-    uno que le acomode o se acaben."""
+def mandar_lista_dias(remitente, pagina=0):
+    """Paso 1: los dias que tienen huecos libres. La lista se arma siempre
+    desde hoy, asi que volver aqui desde un dia nunca descarta los anteriores."""
     try:
-        horarios, hay_mas = obtener_horarios_disponibles(
-            saltar=pagina * SLOTS_POR_PAGINA)
+        agenda = obtener_agenda()
     except Exception as e:
         print("Error consultando horarios en Cal.com:", e)
         enviar_whatsapp(remitente,
             "Se me trabo revisando la agenda, dame un momento y seguimos 😅")
         return
 
-    if not horarios:
-        if pagina > 0:
-            # Se acabo la agenda: mejor volver al principio que dejarla sin
-            # opciones despues de haber pedido "otro horario".
-            enviar_whatsapp(remitente,
-                f"Esos son todos los huecos que tiene libres {ASESOR_CORTO} por "
-                f"ahora 🙈 Te vuelvo a poner los primeros, y si ninguno te "
-                f"acomoda dime que dia te queda mejor y lo checo con el.")
-            mandar_lista_horarios(remitente, 0)
-        else:
-            enviar_whatsapp(remitente,
-                f"Por ahora no veo huecos libres en los proximos dias, dejame "
-                f"checar con {ASESOR_CORTO} y te aviso 🙏")
+    fechas = list(agenda)
+    if not fechas:
+        enviar_whatsapp(remitente,
+            f"Por ahora no veo huecos libres en los proximos dias, dejame "
+            f"checar con {ASESOR_CORTO} y te aviso 🙏")
         return
 
-    horarios_mostrados[remitente] = {"slots": horarios, "pagina": pagina}
-    filas = [
-        {
-            "id": f"slot_{i}",
-            "title": formatear_slot(h),
-            "description": formatear_slot_largo(h).capitalize(),
-        }
-        for i, h in enumerate(horarios)
-    ]
+    # Si se pasaron del final (agenda mas corta que la ultima vez), se regresa
+    # al principio en vez de dejar a la persona con una lista vacia.
+    if pagina * DIAS_POR_PAGINA >= len(fechas):
+        pagina = 0
+
+    tanda = fechas[pagina * DIAS_POR_PAGINA:(pagina + 1) * DIAS_POR_PAGINA]
+    hay_mas = len(fechas) > (pagina + 1) * DIAS_POR_PAGINA
+
+    horarios_mostrados[remitente] = {
+        "modo": "dias",
+        "dias": tanda,
+        "pagina_dias": pagina,
+    }
+    filas = []
+    for i, fecha in enumerate(tanda):
+        horas = agenda[fecha]
+        filas.append({
+            "id": f"dia_{i}",
+            "title": formatear_dia(fecha),
+            "description": (f"{len(horas)} horarios, desde las "
+                            f"{formatear_hora(horas[0])}"),
+        })
     if hay_mas:
         filas.append({
-            "id": "mas_horarios",
-            "title": "Otro horario",
-            "description": "Ninguno me acomoda, ver mas opciones",
+            "id": "mas_dias",
+            "title": "Otras fechas",
+            "description": "Ver mas dias mas adelante",
         })
 
     if pagina == 0:
-        cuerpo = (f"Estos son los horarios que tiene libres {ASESOR_CORTO}. "
+        cuerpo = (f"Estos son los dias que {ASESOR_CORTO} tiene libres. "
+                  f"Cual te queda mejor?")
+    else:
+        cuerpo = "Va, estas son las fechas que siguen. Cual te queda mejor?"
+
+    enviar_lista_whatsapp(remitente, cuerpo, "Ver dias", filas,
+                          titulo="Dias disponibles")
+
+
+def mandar_lista_horas(remitente, fecha, pagina=0):
+    """Paso 2: las horas libres de ese dia, mas las salidas "mas tarde ese
+    dia" y "otro dia" para que nadie se quede sin opcion."""
+    try:
+        agenda = obtener_agenda()
+    except Exception as e:
+        print("Error consultando horarios en Cal.com:", e)
+        enviar_whatsapp(remitente,
+            "Se me trabo revisando la agenda, dame un momento y seguimos 😅")
+        return
+
+    horas = agenda.get(fecha)
+    if not horas:
+        enviar_whatsapp(remitente,
+            f"Uy, {formatear_dia_largo(fecha)} se acaba de llenar 🙈 "
+            f"Estos son los dias que siguen libres:")
+        mandar_lista_dias(remitente, 0)
+        return
+
+    if pagina * HORAS_POR_PAGINA >= len(horas):
+        pagina = 0
+
+    tanda = horas[pagina * HORAS_POR_PAGINA:(pagina + 1) * HORAS_POR_PAGINA]
+    hay_mas = len(horas) > (pagina + 1) * HORAS_POR_PAGINA
+
+    horarios_mostrados[remitente] = {
+        "modo": "horas",
+        "fecha": fecha,
+        "slots": tanda,
+        "pagina_horas": pagina,
+    }
+    filas = [{"id": f"slot_{i}", "title": formatear_hora(h)}
+             for i, h in enumerate(tanda)]
+    if hay_mas:
+        filas.append({
+            "id": "mas_horas",
+            "title": "Mas tarde ese dia",
+            "description": f"Ver horarios mas tarde del {formatear_dia_largo(fecha)}",
+        })
+    filas.append({
+        "id": "otro_dia",
+        "title": "Otro dia",
+        "description": "Ninguno me acomoda, ver otras fechas",
+    })
+
+    if pagina == 0:
+        cuerpo = (f"Estas son las horas libres del {formatear_dia_largo(fecha)}. "
                   f"Cual te acomoda?")
     else:
-        cuerpo = "Va, aqui tienes mas opciones. Cual te queda mejor?"
+        cuerpo = (f"Mas horarios del {formatear_dia_largo(fecha)}. "
+                  f"Cual te acomoda?")
 
-    enviar_lista_whatsapp(remitente, cuerpo, "Ver horarios", filas)
+    enviar_lista_whatsapp(remitente, cuerpo, "Ver horarios", filas,
+                          titulo=formatear_dia(fecha))
+
+
+def mandar_lista_horarios(remitente):
+    """Entrada del flujo de agendado: siempre arranca por los dias."""
+    mandar_lista_dias(remitente, 0)
 
 
 def manejar_seleccion_horario(remitente, id_boton, value):
+    """Un solo lugar para todo lo que se toca en las listas: dias, horas y las
+    filas de navegacion."""
     estado = horarios_mostrados.get(remitente) or {}
-    horarios = estado.get("slots")
 
-    # Pidio ver mas: se le manda la siguiente tanda y no pasa nada mas.
-    if id_boton == "mas_horarios":
-        mandar_lista_horarios(remitente, estado.get("pagina", 0) + 1)
+    if id_boton == "otro_dia":
+        mandar_lista_dias(remitente, 0)
         return
 
-    idx = None
-    if horarios and id_boton.startswith("slot_"):
-        try:
-            idx = int(id_boton.split("_", 1)[1])
-        except ValueError:
-            idx = None
+    if id_boton == "mas_dias":
+        mandar_lista_dias(remitente, estado.get("pagina_dias", 0) + 1)
+        return
 
+    if id_boton == "mas_horas":
+        fecha = estado.get("fecha")
+        if not fecha:
+            mandar_lista_dias(remitente, 0)
+            return
+        mandar_lista_horas(remitente, fecha, estado.get("pagina_horas", 0) + 1)
+        return
+
+    if id_boton.startswith("dia_"):
+        dias = estado.get("dias") or []
+        idx = _indice(id_boton)
+        if idx is None or idx >= len(dias):
+            mandar_lista_dias(remitente, 0)
+            return
+        mandar_lista_horas(remitente, dias[idx], 0)
+        return
+
+    horarios = estado.get("slots") or []
+    idx = _indice(id_boton) if id_boton.startswith("slot_") else None
     if idx is None or idx >= len(horarios):
+        # Casi siempre pasa porque el servicio se reinicio y se perdio el
+        # estado en memoria: se vuelve a empezar en vez de dejarla trabada.
         enviar_whatsapp(remitente,
-            "Ese horario ya no esta disponible 🙏 Dime y te muestro otros.")
+            "Perdon, perdi el hilo de los horarios 😅 Te los pongo de nuevo:")
+        mandar_lista_dias(remitente, 0)
         return
 
     nombre = None
@@ -656,8 +754,16 @@ def manejar_seleccion_horario(remitente, id_boton, value):
         "nombre": nombre or "Prospecto",
     }
     enviar_whatsapp(remitente,
-        f"Perfecto, {formatear_slot_largo(horarios[idx])}. Cual es tu correo "
+        f"Perfecto, {formatear_slot_largo(horarios[idx])} Cual es tu correo "
         f"para mandarte la confirmacion de la cita?")
+
+
+def _indice(id_boton):
+    """'slot_3' -> 3. None si viene algo raro."""
+    try:
+        return int(id_boton.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
 
 
 def normalizar_telefono(wa_id):
@@ -726,14 +832,14 @@ def manejar_correo(remitente, texto):
                        f"con {ASESOR_NOMBRE}]",
         })
         enviar_whatsapp(remitente,
-            f"Listo! Quedo agendado {formatear_slot_largo(pendiente['start'])}. "
+            f"Listo! Quedo agendado {formatear_slot_largo(pendiente['start'])} "
             f"{ASESOR_CORTO} ya quedo notificado y te llega la confirmacion "
             f"a {correo} 😊")
     else:
         print("Error creando reserva en Cal.com:", detalle)
         enviar_whatsapp(remitente,
-            "Uy, ese horario se acaba de ocupar 🙈 Estos son los que siguen "
-            "libres:")
+            "Uy, ese horario se acaba de ocupar 🙈 Estos son los dias que "
+            "siguen libres:")
         mandar_lista_horarios(remitente)
 
 
