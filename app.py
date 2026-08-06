@@ -190,9 +190,17 @@ CALCOM_BASE = "https://api.cal.com/v2"
 # Si alguien conversa y se va sin agendar, Valentina le escribe UNA vez a las
 # 23 h y se calla. Uno, no tres: ver MAX_SEGUIMIENTOS mas abajo.
 #
-# Se apaga de tres maneras: pidiendo que ya no le escriban (el boton, o
-# escribiendolo — ver pide_que_no_le_escriban), agendando, o dejando pasar ese
-# unico seguimiento sin contestar.
+# UNO EN TODA LA VIDA DE ESA PERSONA, no uno por cada vez que se enfria. Es la
+# diferencia importante: antes cualquier respuesta reiniciaba el contador, asi
+# que quien contestaba y se volvia a quedar callado recibia otro, y otro. Ahora
+# el que ya recibio el suyo entra a la lista de no-molestar y ahi se queda.
+#
+# Valentina SIEMPRE le contesta a quien le escriba, este en la lista o no. Lo
+# unico que se apaga es que arranque ella la conversacion.
+#
+# Se apaga de tres maneras, todas definitivas: pidiendo que ya no le escriban
+# (el boton, o escribiendolo — ver pide_que_no_le_escriban), agendando, o
+# recibiendo ese unico seguimiento.
 #
 # LA REGLA DE META QUE MANDA SOBRE TODO ESTO: solo se puede mandar un mensaje
 # libre dentro de las 24 h siguientes al ULTIMO MENSAJE QUE ESCRIBIO LA PERSONA
@@ -256,6 +264,31 @@ PLANTILLA_IDIOMA = os.environ.get("PLANTILLA_IDIOMA", "es_MX").strip()
 # un id propio: en el webhook llega el texto del boton, asi que tiene que
 # coincidir letra por letra con el que se aprobo en Meta.
 PLANTILLA_BOTON_STOP = os.environ.get("PLANTILLA_BOTON_STOP", "Ya no me escribas").strip()
+
+# ---------------------------------------------------------------------------
+# LISTA "NO MOLESTAR" — la unica memoria que sobrevive a un redeploy
+# ---------------------------------------------------------------------------
+# El disco de Render es efimero: cada deploy borra seguimientos.json. Eso hacia
+# que alguien que ya habia pedido que no le escribieran volviera a la casilla de
+# salida en cuanto se subia codigo nuevo. Por eso UNA sola cosa se guarda fuera:
+# el conjunto de numeros a los que Valentina NO debe escribirle nunca por su
+# cuenta. Entran por tres puertas distintas y salen por ninguna:
+#
+#   1. pidieron que no les escriban (boton o escrito)
+#   2. agendaron la llamada
+#   3. ya recibieron su unico seguimiento
+#
+# La lista SOLO CRECE. No hay codigo que saque a nadie, asi que no existe el bug
+# de "se me desactivo el silencio sin querer".
+#
+# Se usa Upstash (Redis) porque su API es HTTP puro: no hace falta ninguna
+# libreria nueva, requests ya estaba aqui para hablar con Meta. El plan gratis
+# aguanta de sobra (esto escribe unas pocas veces al mes).
+#
+# En Render hay que poner dos variables: UPSTASH_URL y UPSTASH_TOKEN.
+UPSTASH_URL = os.environ.get("UPSTASH_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN", "").strip()
+CLAVE_NO_MOLESTAR = os.environ.get("CLAVE_NO_MOLESTAR", "no_molestar").strip()
 
 # Redes sociales de {ASESOR}: van en el primer seguimiento para que la persona
 # pueda ver quien es antes de decidir. Es la unica parte del bot donde salen
@@ -479,11 +512,21 @@ citas_agendadas = {}
 
 # Estado de reenganche por persona. Formato:
 #   {remitente: {"ultimo_mensaje": iso,   # ultima vez que ELLA escribio
-#                "enviados": 0,            # seguimientos ya mandados seguidos
+#                "enviados": 0,            # seguimientos mandados EN TODA SU VIDA
 #                "ultimo_envio": iso|None, # cuando se mando el ultimo
 #                "agendo": False,          # tiene cita en pie -> no se le escribe
-#                "detenido": False}}       # toco el boton de "ya no" -> nunca mas
+#                "detenido": False}}       # no se le escribe por su cuenta nunca mas
+# Esto vive en disco y se pierde en cada deploy. No importa: lo unico que no se
+# puede perder es la lista de no-molestar, que vive en Upstash (ver abajo).
 seguimientos = {}
+
+# Numeros a los que Valentina no debe escribirle por su cuenta nunca mas. Es la
+# copia en memoria de lo que hay en Upstash; se llena al arrancar.
+no_molestar = set()
+# False mientras no se haya podido leer la lista. Si se queda en False NO se
+# manda ningun seguimiento: es preferible mandar de menos (nadie se entera) que
+# escribirle a alguien que pidio que lo dejaran en paz.
+no_molestar_cargada = False
 
 DIAS_ES = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
@@ -1182,6 +1225,54 @@ def _desde_iso(texto):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _upstash(comando):
+    """Manda un comando a Upstash por HTTP. `comando` es una lista, tal cual se
+    escribiria en Redis: ["SADD", "no_molestar", "5215512345678"]."""
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        return None
+    r = requests.post(UPSTASH_URL,
+                      headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                      json=comando, timeout=8)
+    r.raise_for_status()
+    return r.json().get("result")
+
+
+def cargar_no_molestar():
+    """Trae de Upstash la lista de numeros a los que no hay que escribirles.
+    Se llama al arrancar; si falla se reintenta en el siguiente ping del cron."""
+    global no_molestar_cargada
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        print("*** SIN UPSTASH: no hay lista de no-molestar que sobreviva a un "
+              "redeploy, asi que NO se mandara ningun seguimiento. Poner "
+              "UPSTASH_URL y UPSTASH_TOKEN en Render. ***")
+        return
+    try:
+        resultado = _upstash(["SMEMBERS", CLAVE_NO_MOLESTAR]) or []
+    except Exception as e:
+        print("No se pudo leer la lista de no-molestar de Upstash:", e)
+        return
+    no_molestar.update(str(x) for x in resultado)
+    no_molestar_cargada = True
+    print(f"No-molestar recuperados de Upstash: {len(no_molestar)} numero(s).")
+
+
+def agregar_no_molestar(remitente, motivo):
+    """Apaga los mensajes por iniciativa propia hacia este numero, para siempre.
+    Escribe primero en memoria (efecto inmediato aunque Upstash este caido) y
+    despues afuera (para que aguante el proximo deploy)."""
+    no_molestar.add(remitente)
+    est = _estado(remitente)
+    est["detenido"] = True
+    guardar_seguimientos()
+    try:
+        _upstash(["SADD", CLAVE_NO_MOLESTAR, remitente])
+        print(f"No-molestar: {remitente} ({motivo}).")
+    except Exception as e:
+        # Que falle Upstash no debe tumbar la conversacion. Queda apagado en
+        # memoria; lo que se pierde es que aguante el proximo deploy.
+        print(f"No se pudo guardar {remitente} en Upstash ({motivo}):", e)
+
+
 def cargar_seguimientos():
     """Recupera el estado del disco al arrancar. Un reinicio de Render no
     deberia hacer que la gente pendiente se quede sin su seguimiento."""
@@ -1208,7 +1299,7 @@ def guardar_seguimientos():
 
 
 def _estado(remitente):
-    return seguimientos.setdefault(remitente, {
+    est = seguimientos.setdefault(remitente, {
         "ultimo_mensaje": None,
         "enviados": 0,
         "ultimo_envio": None,
@@ -1216,48 +1307,60 @@ def _estado(remitente):
         "agendo": False,
         "detenido": False,
     })
+    # AQUI es donde el silencio sobrevive a un deploy. Despues de subir codigo
+    # nuevo este diccionario arranca vacio, asi que la primera vez que la
+    # persona escribe se le crea una ficha en blanco con detenido=False. Si su
+    # numero esta en la lista de Upstash, se le vuelve a poner el freno antes de
+    # que nadie lo lea.
+    if not est.get("detenido") and remitente in no_molestar:
+        est["detenido"] = True
+    return est
 
 
 def registrar_mensaje_entrante(remitente):
-    """Cualquier cosa que llegue de la persona (texto o un boton) cuenta como
-    respuesta: reabre la ventana de 24 h de Meta y reinicia la cuenta de
-    seguimientos, asi que si vuelve a enfriarse la secuencia empieza de cero."""
+    """Cualquier cosa que llegue de la persona (texto o un boton) reabre la
+    ventana de 24 h de Meta.
+
+    OJO CON LO QUE **NO** HACE: ya no reinicia `enviados`. Antes si, y por eso
+    el limite de "un seguimiento" era en realidad "un seguimiento cada vez que
+    se enfria": la persona contestaba, el contador volvia a 0, se volvia a
+    quedar callada y le caia otro. Alguien apenas molesto terminaba muy
+    molesto. Ahora `enviados` cuenta para toda la vida: uno y nunca mas."""
     est = _estado(remitente)
     est["ultimo_mensaje"] = _iso(_ahora())
-    est["enviados"] = 0
-    est["ultimo_envio"] = None
     est["intentos"] = 0
     guardar_seguimientos()
 
 
 def marcar_agendado(remitente):
-    """Ya tiene cita: se acabaron los seguimientos mientras siga en pie."""
+    """Ya tiene cita: se acabaron los mensajes por iniciativa propia. Entra a la
+    lista de Upstash porque si no, un deploy borraria la cita de la memoria y
+    Valentina se pondria a insistirle que agende algo que YA agendo — justo a la
+    persona con mas ganas de comprar."""
     est = _estado(remitente)
     est["agendo"] = True
-    est["enviados"] = 0
-    est["ultimo_envio"] = None
     est["intentos"] = 0
-    guardar_seguimientos()
+    agregar_no_molestar(remitente, "agendo")
 
 
 def marcar_cita_cancelada(remitente):
-    """Cancelo: vuelve a estar sin cita, asi que la secuencia se rearma desde
-    cero contando a partir de ahora."""
+    """Cancelo: se anota que ya no tiene cita, pero NO se le vuelve a encender
+    el seguimiento automatico. Ya entro a la lista de no-molestar al agendar y
+    de esa lista no sale nadie. A quien agenda y cancela lo llama una persona,
+    no un bot insistiendo."""
     est = _estado(remitente)
     est["agendo"] = False
-    est["enviados"] = 0
-    est["ultimo_envio"] = None
     est["intentos"] = 0
     est["ultimo_mensaje"] = _iso(_ahora())
     guardar_seguimientos()
 
 
 def detener_seguimientos(remitente):
-    """Toco el boton de "ya no me escribas". Es definitivo: ni siquiera vuelve
-    a activarse si despues escribe, salvo que agende (ahi ya no aplica)."""
-    est = _estado(remitente)
-    est["detenido"] = True
-    guardar_seguimientos()
+    """Pidio que ya no le escriban (por el boton o escribiendolo). Es definitivo
+    y sobrevive a los deploys: entra a la lista de Upstash. Sigue pudiendo
+    escribirle a Valentina cuando quiera y ella le contesta normal; lo que se
+    apaga es que ella arranque conversacion por su cuenta."""
+    agregar_no_molestar(remitente, "pidio que no le escriban")
     enviar_whatsapp(remitente,
         "Listo, no te escribo mas 🙏 Si algun dia quieres retomar, aqui estoy: "
         "solo mandame un mensaje y con gusto te ayudo.")
@@ -1366,6 +1469,17 @@ def revisar_seguimientos():
     """Manda los seguimientos que ya tocan. Lo llama el despertador de
     UptimeRobot en cada ping (cada 5 min), que es la unica cosa que corre sola
     en este servicio: Render Free duerme el proceso y no hay cron."""
+    # Si no se pudo leer la lista de no-molestar, no se manda NADA. Sin ella no
+    # hay forma de saber quien pidio que lo dejaran en paz, y entre "se queda
+    # sin su recordatorio" y "le escribo a alguien que dijo que no", la unica
+    # equivocacion que se paga cara es la segunda. Se reintenta la lectura por
+    # si fue una caida de un momento.
+    if not no_molestar_cargada:
+        cargar_no_molestar()
+    if not no_molestar_cargada:
+        print("Seguimientos en pausa: no se pudo leer la lista de no-molestar.")
+        return 0
+
     ahora = _ahora()
     mandados = 0
     cambio = False
@@ -1373,7 +1487,7 @@ def revisar_seguimientos():
     for remitente, est in list(seguimientos.items()):
         if mandados >= MAX_ENVIOS_POR_TICK:
             break
-        if est.get("detenido") or est.get("agendo"):
+        if remitente in no_molestar or est.get("detenido") or est.get("agendo"):
             continue
 
         ya = est.get("enviados", 0)
@@ -1421,6 +1535,10 @@ def revisar_seguimientos():
         est["ultimo_envio"] = _iso(ahora)
         est["intentos"] = 0
         mandados += 1
+        # Ya gasto su unico mensaje por iniciativa propia: a la lista, para que
+        # ni un deploy ni un contador reiniciado le den un segundo.
+        if est["enviados"] >= MAX_SEGUIMIENTOS:
+            agregar_no_molestar(remitente, "ya recibio su seguimiento")
         # Se le deja la nota al modelo para que si la persona contesta,
         # Valentina sepa que ya le escribio y no arranque de cero.
         historiales.setdefault(remitente, []).append({
@@ -1434,6 +1552,9 @@ def revisar_seguimientos():
     return mandados
 
 
+# Primero la lista que sobrevive a los deploys, porque cargar_seguimientos()
+# reconstruye fichas y _estado() necesita saber ya quien esta silenciado.
+cargar_no_molestar()
 cargar_seguimientos()
 
 
