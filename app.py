@@ -38,6 +38,7 @@ Flujo:
 import os
 import re
 import json
+import unicodedata
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -186,38 +187,43 @@ CALCOM_BASE = "https://api.cal.com/v2"
 # ---------------------------------------------------------------------------
 # SEGUIMIENTOS — reenganchar a quien no agendo
 # ---------------------------------------------------------------------------
-# Si alguien conversa y se va sin agendar, Valentina le escribe hasta 3 veces,
-# una por dia, y se calla. El boton de "ya no me escribas" corta la secuencia
-# para siempre.
+# Si alguien conversa y se va sin agendar, Valentina le escribe UNA vez a las
+# 23 h y se calla. Uno, no tres: ver MAX_SEGUIMIENTOS mas abajo.
+#
+# Se apaga de tres maneras: pidiendo que ya no le escriban (el boton, o
+# escribiendolo — ver pide_que_no_le_escriban), agendando, o dejando pasar ese
+# unico seguimiento sin contestar.
 #
 # LA REGLA DE META QUE MANDA SOBRE TODO ESTO: solo se puede mandar un mensaje
 # libre dentro de las 24 h siguientes al ULTIMO MENSAJE QUE ESCRIBIO LA PERSONA
 # (la "customer service window"). Mandarle algo NO reabre la ventana: solo la
-# reabre ella escribiendo. Por eso:
+# reabre ella escribiendo. Por eso el seguimiento sale a las 23 h: cae DENTRO de
+# la ventana, es un mensaje normal con botones de verdad, sin aprobacion de Meta
+# y sin costo.
 #
-#   Seguimiento 1  -> a las 23 h. Cae DENTRO de la ventana: mensaje normal con
-#                     botones de verdad, sin aprobacion de Meta y sin costo.
-#   Seguimiento 2 y 3 -> ya fuera de la ventana. Meta SOLO acepta plantillas
-#                     (templates) aprobadas de categoria Marketing, y encima el
-#                     numero de pruebas no puede mandarlas. Por eso el codigo
-#                     esta listo pero APAGADO: si PLANTILLA_SEGUIMIENTO viene
-#                     vacia se saltan y se registra en el log.
-#
-# Para prenderlos: crear la plantilla en WhatsApp Manager (categoria Marketing,
-# con un boton de respuesta rapida cuyo texto sea el de PLANTILLA_BOTON_STOP) y
-# poner su nombre en la variable de entorno PLANTILLA_SEGUIMIENTO en Render.
+# Cualquier seguimiento posterior caeria FUERA, y ahi Meta solo acepta plantillas
+# aprobadas de categoria Marketing: se cobran por mensaje, necesitan numero real
+# con la cuenta verificada, y el numero de pruebas no puede mandarlas. Esa
+# maquinaria sigue escrita aqui abajo pero hoy no corre, porque MAX_SEGUIMIENTOS
+# vale 1. Para reactivarla: crear la plantilla en WhatsApp Manager (categoria
+# Marketing, con un boton de respuesta rapida cuyo texto sea el de
+# PLANTILLA_BOTON_STOP), poner su nombre en PLANTILLA_SEGUIMIENTO y subir
+# MAX_SEGUIMIENTOS a 3, las tres en Render.
 #
 # Los tiempos se miden en MINUTOS para poder probarlos sin esperar un dia. En
 # produccion se dejan en blanco y valen 23 h y 24 h. Para una prueba, en Render:
 #   MINUTOS_PRIMER_SEGUIMIENTO = 1
 #   MINUTOS_ENTRE_SEGUIMIENTOS = 1
 # y al terminar SE BORRAN esas dos variables. Si se quedan puestas, cualquiera
-# que escriba y no agende recibe los 3 seguimientos en 3 minutos.
+# que escriba y no agende recibe su seguimiento al minuto.
 #
 # OJO con la resolucion: el reloj son los pings de UptimeRobot cada 5 min, asi
 # que poner 1 minuto no significa "al minuto exacto", significa "en el siguiente
 # ping". Para verlo al instante hay que pegarle a mano a /cron/seguimientos.
-def _minutos(nombre, por_defecto):
+def _entero_env(nombre, por_defecto):
+    """Lee un numero de una variable de entorno. Si viene vacia, con basura o
+    en cero, se queda con el valor de produccion: nunca un 0 que dispare en
+    bucle ni un crash al arrancar por un dedazo en el panel de Render."""
     try:
         v = int(os.environ.get(nombre, "").strip() or por_defecto)
         return v if v > 0 else por_defecto
@@ -225,9 +231,15 @@ def _minutos(nombre, por_defecto):
         print(f"{nombre} no es un numero, se usa {por_defecto}.")
         return por_defecto
 
-MINUTOS_PRIMER_SEGUIMIENTO = _minutos("MINUTOS_PRIMER_SEGUIMIENTO", 23 * 60)
-MINUTOS_ENTRE_SEGUIMIENTOS = _minutos("MINUTOS_ENTRE_SEGUIMIENTOS", 24 * 60)
-MAX_SEGUIMIENTOS = 3
+MINUTOS_PRIMER_SEGUIMIENTO = _entero_env("MINUTOS_PRIMER_SEGUIMIENTO", 23 * 60)
+MINUTOS_ENTRE_SEGUIMIENTOS = _entero_env("MINUTOS_ENTRE_SEGUIMIENTOS", 24 * 60)
+# UN solo seguimiento por persona. Se decidio asi a proposito: el 2do y el 3ro
+# caen fuera de la ventana de 24 h de Meta, o sea que necesitan plantilla
+# aprobada, numero real y se cobran por mensaje. Antes se intentaban igual y
+# morian en el log; ahora ni se intentan. Si algun dia hay plantilla y se
+# quieren de vuelta, se sube este numero desde Render (MAX_SEGUIMIENTOS = 3) sin
+# tocar el codigo: la maquinaria de plantillas sigue completa aqui abajo.
+MAX_SEGUIMIENTOS = _entero_env("MAX_SEGUIMIENTOS", 1)
 
 if MINUTOS_PRIMER_SEGUIMIENTO < 23 * 60 or MINUTOS_ENTRE_SEGUIMIENTOS < 24 * 60:
     print(f"*** MODO PRUEBA DE SEGUIMIENTOS: 1ro a los "
@@ -377,17 +389,18 @@ Si dice "despues te aviso": "Sin problema, yo te busco en unos dias para
 retomar. Aqui sigo cuando quieras."
 
 ## SEGUIMIENTOS — los manda el sistema, no tu
-Si alguien se queda sin agendar, el sistema le escribe solo, hasta 3 veces, una
-por dia, y ahi para. Tu NO tienes que acordarte ni prometer fechas exactas de
+Si alguien se queda sin agendar, el sistema le escribe solo UNA vez, al dia
+siguiente, y ahi para. Tu NO tienes que acordarte ni prometer fechas exactas de
 reenganche ("te escribo el lunes"): no controlas cuando sale.
-En la conversacion veras notas como "[Seguimiento 2 de 3 enviado: ...]". Eso
-quiere decir que ya le insististe esa cantidad de veces sin respuesta. Si
-despues de eso la persona por fin contesta, NO la reganes ni le reproches el
-silencio ("te escribi tres veces", "pense que ya no te interesaba"): retoma
-calido y directo, como si nada, y ve por la cita.
-La persona tiene un boton para pedir que ya no le escriban. Si te lo pide por
-texto, dile que toque ese boton o simplemente confirmale que no la molestas
-mas, y despidete con amabilidad. Nunca discutas esa decision.
+En la conversacion veras una nota "[Seguimiento enviado: ...]". Quiere decir que
+ya le insististe una vez sin respuesta. Si despues de eso la persona por fin
+contesta, NO la reganes ni le reproches el silencio ("te escribi y no me
+contestaste", "pense que ya no te interesaba"): retoma calido y directo, como si
+nada, y ve por la cita.
+Si pide que ya no le escriban, el sistema lo detecta y lo apaga solo, antes de
+que el mensaje te llegue. O sea que tu nunca vas a tener que contestar a eso: si
+de todos modos algo asi se te cruza, confirmale con amabilidad que no la
+molestan mas y despidete. Nunca discutas esa decision ni intentes convencerla.
 
 ## OBJECIONES — todas terminan proponiendo la cita
 No argumentes ni expliques de mas. Valida en una linea y regresa a la cita.
@@ -547,6 +560,23 @@ def recibir():
             return "ok", 200
 
         texto = msg.get("text", {}).get("body", "")   # el texto que escribio
+
+        # Caso 1.5: pidio por ESCRITO que ya no le escriban. Tiene que atajarse
+        # aqui, antes del modelo: mas arriba registrar_mensaje_entrante() ya le
+        # reinicio la cuenta de seguimientos, asi que si esto no existiera,
+        # pedir "ya no me escribas" terminaria provocando otro seguimiento.
+        # Vale exactamente lo mismo que tocar el boton, porque la gente no lee
+        # botones. El modelo no ve este mensaje: no hay nada que negociar.
+        if pide_que_no_le_escriban(texto):
+            print(f"{remitente} pidio por texto que no le escriban: {texto!r}")
+            detener_seguimientos(remitente)
+            historial = historiales.setdefault(remitente, [])
+            historial.append({"role": "user", "content": texto})
+            historial.append({"role": "assistant",
+                              "content": "[La persona pidio que no le escriban "
+                                         "mas. Seguimientos apagados.]"})
+            del historial[:-MAX_HISTORIAL]
+            return "ok", 200
 
         # Caso 2: conversacion normal, la lleva el modelo.
         historial = historiales.setdefault(remitente, [])
@@ -1233,6 +1263,49 @@ def detener_seguimientos(remitente):
         "solo mandame un mensaje y con gusto te ayudo.")
 
 
+# Frases con las que una persona pide que la dejen en paz ESCRIBIENDO, sin
+# tocar el boton. Sin esto, escribirlo era peor que no escribir nada: el mensaje
+# se iba al modelo (que contesta bonito y no apaga nada) y de paso reiniciaba la
+# cuenta de seguimientos, o sea que pedir "ya no me escribas" garantizaba otro
+# seguimiento. Aqui se atrapa ANTES del modelo.
+#
+# La lista es corta a proposito. El riesgo real no es que se escape uno —ese
+# recibe un seguimiento mas y ya— sino callar a alguien que si quiere comprar:
+# "no me interesa el de vida, quiero gastos medicos" NO debe apagar nada. Por
+# eso no hay nada tipo "no me interesa" ni "no gracias" aqui.
+FRASES_NO_ESCRIBIR = (
+    "ya no me escribas", "ya no me escriban", "no me escribas mas",
+    "no me escriban mas", "deja de escribirme", "dejen de escribirme",
+    "no me vuelvas a escribir", "no me vuelvan a escribir",
+    "no me contactes", "no me contacten", "no quiero que me contacten",
+    "no me molestes", "no me molesten", "dejame en paz", "dejenme en paz",
+    "borrame de la lista", "quitame de la lista", "sacame de la lista",
+    "borra mi numero", "elimina mi numero", "date de baja", "dame de baja",
+)
+# Estas solo cuentan si son TODO el mensaje. "stop" suelto es una salida
+# estandar, pero dentro de una frase larga puede ser cualquier cosa. Aqui NO va
+# "no": Valentina pregunta cosas ("te paso los horarios?") y un "no" seco es una
+# respuesta a la pregunta, no una baja.
+PALABRAS_NO_ESCRIBIR = ("stop", "baja", "unsubscribe", "basta")
+
+
+def _sin_acentos(texto):
+    return "".join(c for c in unicodedata.normalize("NFD", texto)
+                   if unicodedata.category(c) != "Mn")
+
+
+def pide_que_no_le_escriban(texto):
+    """True si la persona esta pidiendo por escrito que ya no le escriban."""
+    limpio = _sin_acentos(texto).lower()
+    limpio = re.sub(r"[^a-z0-9\s]", " ", limpio)
+    limpio = " ".join(limpio.split())
+    if not limpio:
+        return False
+    if limpio in PALABRAS_NO_ESCRIBIR:
+        return True
+    return any(f in limpio for f in FRASES_NO_ESCRIBIR)
+
+
 def texto_primer_seguimiento():
     texto = (f"Hola de nuevo! Soy Valentina 😊 Se me quedo pendiente lo tuyo y "
              f"no quise dejarlo asi. Sigue en pie la llamada con {ASESOR_CORTO} "
@@ -1352,8 +1425,8 @@ def revisar_seguimientos():
         # Valentina sepa que ya le escribio y no arranque de cero.
         historiales.setdefault(remitente, []).append({
             "role": "assistant",
-            "content": f"[Seguimiento {ya + 1} de {MAX_SEGUIMIENTOS} enviado: "
-                       f"se le recordo la llamada con {ASESOR_NOMBRE}]",
+            "content": f"[Seguimiento enviado: se le recordo la llamada con "
+                       f"{ASESOR_NOMBRE}]",
         })
 
     if cambio:
