@@ -37,6 +37,7 @@ Flujo:
 
 import os
 import re
+import json
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -182,6 +183,97 @@ CALCOM_EVENT_TYPE_ID = os.environ.get("CALCOM_EVENT_TYPE_ID", "6525721")
 CALCOM_TIMEZONE = os.environ.get("CALCOM_TIMEZONE", "America/Merida")
 CALCOM_BASE = "https://api.cal.com/v2"
 
+# ---------------------------------------------------------------------------
+# SEGUIMIENTOS — reenganchar a quien no agendo
+# ---------------------------------------------------------------------------
+# Si alguien conversa y se va sin agendar, Valentina le escribe hasta 3 veces,
+# una por dia, y se calla. El boton de "ya no me escribas" corta la secuencia
+# para siempre.
+#
+# LA REGLA DE META QUE MANDA SOBRE TODO ESTO: solo se puede mandar un mensaje
+# libre dentro de las 24 h siguientes al ULTIMO MENSAJE QUE ESCRIBIO LA PERSONA
+# (la "customer service window"). Mandarle algo NO reabre la ventana: solo la
+# reabre ella escribiendo. Por eso:
+#
+#   Seguimiento 1  -> a las 23 h. Cae DENTRO de la ventana: mensaje normal con
+#                     botones de verdad, sin aprobacion de Meta y sin costo.
+#   Seguimiento 2 y 3 -> ya fuera de la ventana. Meta SOLO acepta plantillas
+#                     (templates) aprobadas de categoria Marketing, y encima el
+#                     numero de pruebas no puede mandarlas. Por eso el codigo
+#                     esta listo pero APAGADO: si PLANTILLA_SEGUIMIENTO viene
+#                     vacia se saltan y se registra en el log.
+#
+# Para prenderlos: crear la plantilla en WhatsApp Manager (categoria Marketing,
+# con un boton de respuesta rapida cuyo texto sea el de PLANTILLA_BOTON_STOP) y
+# poner su nombre en la variable de entorno PLANTILLA_SEGUIMIENTO en Render.
+#
+# Los tiempos se miden en MINUTOS para poder probarlos sin esperar un dia. En
+# produccion se dejan en blanco y valen 23 h y 24 h. Para una prueba, en Render:
+#   MINUTOS_PRIMER_SEGUIMIENTO = 1
+#   MINUTOS_ENTRE_SEGUIMIENTOS = 1
+# y al terminar SE BORRAN esas dos variables. Si se quedan puestas, cualquiera
+# que escriba y no agende recibe los 3 seguimientos en 3 minutos.
+#
+# OJO con la resolucion: el reloj son los pings de UptimeRobot cada 5 min, asi
+# que poner 1 minuto no significa "al minuto exacto", significa "en el siguiente
+# ping". Para verlo al instante hay que pegarle a mano a /cron/seguimientos.
+def _minutos(nombre, por_defecto):
+    try:
+        v = int(os.environ.get(nombre, "").strip() or por_defecto)
+        return v if v > 0 else por_defecto
+    except ValueError:
+        print(f"{nombre} no es un numero, se usa {por_defecto}.")
+        return por_defecto
+
+MINUTOS_PRIMER_SEGUIMIENTO = _minutos("MINUTOS_PRIMER_SEGUIMIENTO", 23 * 60)
+MINUTOS_ENTRE_SEGUIMIENTOS = _minutos("MINUTOS_ENTRE_SEGUIMIENTOS", 24 * 60)
+MAX_SEGUIMIENTOS = 3
+
+if MINUTOS_PRIMER_SEGUIMIENTO < 23 * 60 or MINUTOS_ENTRE_SEGUIMIENTOS < 24 * 60:
+    print(f"*** MODO PRUEBA DE SEGUIMIENTOS: 1ro a los "
+          f"{MINUTOS_PRIMER_SEGUIMIENTO} min, luego cada "
+          f"{MINUTOS_ENTRE_SEGUIMIENTOS} min. Borrar esas variables de entorno "
+          f"antes de usar el bot con gente real. ***")
+
+PLANTILLA_SEGUIMIENTO = os.environ.get("PLANTILLA_SEGUIMIENTO", "").strip()
+# Opcional: una segunda plantilla para que el tercer seguimiento no llegue con
+# el texto identico al del segundo. Si se deja vacia se reusa la primera.
+PLANTILLA_SEGUIMIENTO_3 = os.environ.get("PLANTILLA_SEGUIMIENTO_3", "").strip()
+PLANTILLA_IDIOMA = os.environ.get("PLANTILLA_IDIOMA", "es_MX").strip()
+# El texto EXACTO del boton de la plantilla aprobada. Las plantillas no mandan
+# un id propio: en el webhook llega el texto del boton, asi que tiene que
+# coincidir letra por letra con el que se aprobo en Meta.
+PLANTILLA_BOTON_STOP = os.environ.get("PLANTILLA_BOTON_STOP", "Ya no me escribas").strip()
+
+# Redes sociales de {ASESOR}: van en el primer seguimiento para que la persona
+# pueda ver quien es antes de decidir. Es la unica parte del bot donde salen
+# links, y NO los escribe el modelo: son texto fijo de aqui. Esa es la misma
+# razon por la que se quito el link de Cal.com — en produccion el LLM tipeo mal
+# una URL al regenerarla y mando a la gente a una pagina que no existe.
+#
+# Van con https:// completo a proposito: asi WhatsApp los vuelve tocables
+# siempre, sin depender de que detecte el dominio suelto.
+# Se puede sobreescribir desde el .env / Render con REDES_ASESOR en UNA linea.
+# Si se pone vacia, el mensaje sale sin esta parte y no queda ningun hueco raro.
+REDES_ASESOR = os.environ.get("REDES_ASESOR", "").strip() or (
+    "Facebook: https://www.facebook.com/SegurosArroyoCampos/\n"
+    "Instagram: https://instagram.com/segurosarroyocampos\n"
+    "TikTok: https://tiktok.com/@jorgearroyodom\n"
+    "Web: https://segurosarroyocampos.com"
+)
+
+# Cuantos seguimientos se mandan como maximo en un solo ping del despertador.
+# Gunicorn corre con un worker: si se mandaran 200 de golpe, el webhook de
+# WhatsApp se quedaria esperando y la gente veria a Valentina muda.
+MAX_ENVIOS_POR_TICK = 10
+
+# El estado vive en memoria y se copia a disco para aguantar un reinicio de
+# Render. OJO: en Render el disco es efimero, un REDEPLOY si lo borra; los
+# seguimientos pendientes de ese momento se pierden (no se manda de mas, se
+# manda de menos). No vale la pena una base de datos por esto todavia.
+ARCHIVO_SEGUIMIENTOS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "seguimientos.json")
+
 SYSTEM_PROMPT = """
 Eres Valentina. Trabajas con {ASESOR}, asesor de seguros. Atiendes por
 WhatsApp a personas de America Latina.
@@ -281,8 +373,21 @@ libre de verdad.
 No pidas nombre, correo ni telefono: no hacen falta, la cita se cierra con lo
 que ya sabemos de WhatsApp.
 Si dice que ya agendo, agradece y cierra. No pidas nada mas.
-Si dice "despues te aviso": "Sin problema. Te escribo el lunes para retomar?"
-Un solo mensaje de reenganche si se enfria. Nunca insistas dos veces sin respuesta.
+Si dice "despues te aviso": "Sin problema, yo te busco en unos dias para
+retomar. Aqui sigo cuando quieras."
+
+## SEGUIMIENTOS — los manda el sistema, no tu
+Si alguien se queda sin agendar, el sistema le escribe solo, hasta 3 veces, una
+por dia, y ahi para. Tu NO tienes que acordarte ni prometer fechas exactas de
+reenganche ("te escribo el lunes"): no controlas cuando sale.
+En la conversacion veras notas como "[Seguimiento 2 de 3 enviado: ...]". Eso
+quiere decir que ya le insististe esa cantidad de veces sin respuesta. Si
+despues de eso la persona por fin contesta, NO la reganes ni le reproches el
+silencio ("te escribi tres veces", "pense que ya no te interesaba"): retoma
+calido y directo, como si nada, y ve por la cita.
+La persona tiene un boton para pedir que ya no le escriban. Si te lo pide por
+texto, dile que toque ese boton o simplemente confirmale que no la molestas
+mas, y despidete con amabilidad. Nunca discutas esa decision.
 
 ## OBJECIONES — todas terminan proponiendo la cita
 No argumentes ni expliques de mas. Valida en una linea y regresa a la cita.
@@ -359,6 +464,14 @@ HORAS_POR_PAGINA = 8
 # Formato: {remitente: {"uid": "abc123", "start": iso}}
 citas_agendadas = {}
 
+# Estado de reenganche por persona. Formato:
+#   {remitente: {"ultimo_mensaje": iso,   # ultima vez que ELLA escribio
+#                "enviados": 0,            # seguimientos ya mandados seguidos
+#                "ultimo_envio": iso|None, # cuando se mando el ultimo
+#                "agendo": False,          # tiene cita en pie -> no se le escribe
+#                "detenido": False}}       # toco el boton de "ya no" -> nunca mas
+seguimientos = {}
+
 DIAS_ES = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
@@ -400,6 +513,22 @@ def recibir():
         msg = mensajes[0]
         remitente = msg["from"]                       # numero de la persona
 
+        # Cualquier cosa que llegue (texto o boton) reabre la ventana de 24 h
+        # de Meta y reinicia la cuenta de seguimientos.
+        registrar_mensaje_entrante(remitente)
+
+        # Caso 0: boton de una PLANTILLA. Meta no manda un id propio en estos,
+        # llega el texto del boton en msg["button"]["text"] — por eso se compara
+        # contra PLANTILLA_BOTON_STOP, que debe decir exactamente lo mismo que
+        # el boton aprobado en WhatsApp Manager.
+        if msg.get("type") == "button":
+            etiqueta = (msg.get("button") or {}).get("text", "").strip()
+            if etiqueta.lower() == PLANTILLA_BOTON_STOP.lower():
+                detener_seguimientos(remitente)
+            else:
+                mandar_lista_horarios(remitente)
+            return "ok", 200
+
         # Caso 1: tocaron algo (un horario de la lista, o un boton). No pasa
         # por el modelo: es un evento estructurado, se maneja directo.
         interactivo = msg.get("interactive") or {}
@@ -407,7 +536,11 @@ def recibir():
             respuesta = (interactivo.get("list_reply")
                          or interactivo.get("button_reply") or {})
             id_boton = respuesta.get("id", "")
-            if id_boton.startswith("cancelar"):
+            if id_boton == "no_seguimiento":
+                detener_seguimientos(remitente)
+            elif id_boton == "ver_horarios":
+                mandar_lista_horarios(remitente)
+            elif id_boton.startswith("cancelar"):
                 manejar_cancelacion(remitente, id_boton)
             else:
                 manejar_seleccion_horario(remitente, id_boton, value)
@@ -889,6 +1022,8 @@ def agendar(remitente, start_iso, nombre):
 
     dias_descartados.pop(remitente, None)
     citas_agendadas[remitente] = {"uid": uid, "start": start_iso}
+    # Ya agendo: se apagan los seguimientos mientras la cita siga en pie.
+    marcar_agendado(remitente)
     # Se le avisa al modelo para que no vuelva a proponer la cita.
     historiales.setdefault(remitente, []).append({
         "role": "assistant",
@@ -982,6 +1117,9 @@ def manejar_cancelacion(remitente, id_boton):
         return
 
     citas_agendadas.pop(remitente, None)
+    # Vuelve a estar sin cita: la secuencia de seguimientos se rearma desde
+    # cero, contando 23 h a partir de este momento.
+    marcar_cita_cancelada(remitente)
     historiales.setdefault(remitente, []).append({
         "role": "assistant",
         "content": f"[Cita cancelada por la persona: "
@@ -993,9 +1131,258 @@ def manejar_cancelacion(remitente, id_boton):
         f"dime y te paso los horarios 😊")
 
 
+# ---------------------------------------------------------------------------
+# 6) SEGUIMIENTOS — reenganchar a quien se fue sin agendar
+# ---------------------------------------------------------------------------
+def _ahora():
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def _desde_iso(texto):
+    if not texto:
+        return None
+    try:
+        dt = datetime.fromisoformat(texto)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def cargar_seguimientos():
+    """Recupera el estado del disco al arrancar. Un reinicio de Render no
+    deberia hacer que la gente pendiente se quede sin su seguimiento."""
+    try:
+        with open(ARCHIVO_SEGUIMIENTOS, encoding="utf-8") as f:
+            datos = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print("No se pudo leer seguimientos.json:", e)
+        return
+    if isinstance(datos, dict):
+        seguimientos.update(datos)
+        print(f"Seguimientos recuperados: {len(seguimientos)} personas.")
+
+
+def guardar_seguimientos():
+    try:
+        with open(ARCHIVO_SEGUIMIENTOS, "w", encoding="utf-8") as f:
+            json.dump(seguimientos, f)
+    except Exception as e:
+        # Que no se pueda guardar no debe tumbar la conversacion en curso.
+        print("No se pudo guardar seguimientos.json:", e)
+
+
+def _estado(remitente):
+    return seguimientos.setdefault(remitente, {
+        "ultimo_mensaje": None,
+        "enviados": 0,
+        "ultimo_envio": None,
+        "intentos": 0,
+        "agendo": False,
+        "detenido": False,
+    })
+
+
+def registrar_mensaje_entrante(remitente):
+    """Cualquier cosa que llegue de la persona (texto o un boton) cuenta como
+    respuesta: reabre la ventana de 24 h de Meta y reinicia la cuenta de
+    seguimientos, asi que si vuelve a enfriarse la secuencia empieza de cero."""
+    est = _estado(remitente)
+    est["ultimo_mensaje"] = _iso(_ahora())
+    est["enviados"] = 0
+    est["ultimo_envio"] = None
+    est["intentos"] = 0
+    guardar_seguimientos()
+
+
+def marcar_agendado(remitente):
+    """Ya tiene cita: se acabaron los seguimientos mientras siga en pie."""
+    est = _estado(remitente)
+    est["agendo"] = True
+    est["enviados"] = 0
+    est["ultimo_envio"] = None
+    est["intentos"] = 0
+    guardar_seguimientos()
+
+
+def marcar_cita_cancelada(remitente):
+    """Cancelo: vuelve a estar sin cita, asi que la secuencia se rearma desde
+    cero contando a partir de ahora."""
+    est = _estado(remitente)
+    est["agendo"] = False
+    est["enviados"] = 0
+    est["ultimo_envio"] = None
+    est["intentos"] = 0
+    est["ultimo_mensaje"] = _iso(_ahora())
+    guardar_seguimientos()
+
+
+def detener_seguimientos(remitente):
+    """Toco el boton de "ya no me escribas". Es definitivo: ni siquiera vuelve
+    a activarse si despues escribe, salvo que agende (ahi ya no aplica)."""
+    est = _estado(remitente)
+    est["detenido"] = True
+    guardar_seguimientos()
+    enviar_whatsapp(remitente,
+        "Listo, no te escribo mas 🙏 Si algun dia quieres retomar, aqui estoy: "
+        "solo mandame un mensaje y con gusto te ayudo.")
+
+
+def texto_primer_seguimiento():
+    texto = (f"Hola de nuevo! Soy Valentina 😊 Se me quedo pendiente lo tuyo y "
+             f"no quise dejarlo asi. Sigue en pie la llamada con {ASESOR_CORTO} "
+             f"cuando tu puedas, son 10 o 15 minutos y sin compromiso.")
+    if REDES_ASESOR:
+        texto += (f"\n\nPor si quieres conocerlo antes:\n{REDES_ASESOR}")
+    texto += "\n\nTe paso los horarios que tiene libres?"
+    return texto
+
+
+def enviar_seguimiento(remitente, numero):
+    """Manda el seguimiento numero 1, 2 o 3.
+
+    Devuelve "enviado", "sin_plantilla" (los de dia 2 y 3 cuando todavia no hay
+    plantilla aprobada) o "error".
+
+    El 1 cae dentro de la ventana de 24 h de Meta, asi que puede ser un mensaje
+    normal con botones. El 2 y el 3 caen fuera y Meta SOLO acepta plantillas
+    aprobadas: sin PLANTILLA_SEGUIMIENTO configurada no hay forma de mandarlos.
+    """
+    if numero == 1:
+        r = _post_whatsapp({
+            "messaging_product": "whatsapp",
+            "to": remitente,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": texto_primer_seguimiento()},
+                "action": {"buttons": [
+                    {"type": "reply", "reply": {"id": "ver_horarios",
+                                                "title": "Ver horarios"}},
+                    {"type": "reply", "reply": {"id": "no_seguimiento",
+                                                "title": "Ya no me escribas"}},
+                ]},
+            },
+        })
+        return "enviado" if r.status_code < 400 else "error"
+
+    plantilla = PLANTILLA_SEGUIMIENTO
+    if numero == 3 and PLANTILLA_SEGUIMIENTO_3:
+        plantilla = PLANTILLA_SEGUIMIENTO_3
+    if not plantilla:
+        return "sin_plantilla"
+
+    r = _post_whatsapp({
+        "messaging_product": "whatsapp",
+        "to": remitente,
+        "type": "template",
+        "template": {
+            "name": plantilla,
+            "language": {"code": PLANTILLA_IDIOMA},
+        },
+    })
+    return "enviado" if r.status_code < 400 else "error"
+
+
+def revisar_seguimientos():
+    """Manda los seguimientos que ya tocan. Lo llama el despertador de
+    UptimeRobot en cada ping (cada 5 min), que es la unica cosa que corre sola
+    en este servicio: Render Free duerme el proceso y no hay cron."""
+    ahora = _ahora()
+    mandados = 0
+    cambio = False
+
+    for remitente, est in list(seguimientos.items()):
+        if mandados >= MAX_ENVIOS_POR_TICK:
+            break
+        if est.get("detenido") or est.get("agendo"):
+            continue
+
+        ya = est.get("enviados", 0)
+        if ya >= MAX_SEGUIMIENTOS:
+            continue
+
+        if ya == 0:
+            desde = _desde_iso(est.get("ultimo_mensaje"))
+            espera = timedelta(minutes=MINUTOS_PRIMER_SEGUIMIENTO)
+        else:
+            desde = _desde_iso(est.get("ultimo_envio"))
+            espera = timedelta(minutes=MINUTOS_ENTRE_SEGUIMIENTOS)
+        if not desde or ahora - desde < espera:
+            continue
+
+        try:
+            resultado = enviar_seguimiento(remitente, ya + 1)
+        except Exception as e:
+            # Que se caiga el envio de UNA persona no debe dejar sin su
+            # seguimiento a las demas que ya les tocaba en este mismo ping.
+            print(f"Error mandando seguimiento a {remitente}:", e)
+            resultado = "error"
+        cambio = True
+
+        if resultado == "sin_plantilla":
+            # No hay plantilla aprobada todavia: se cierra la secuencia en vez
+            # de reintentar cada 5 minutos para siempre.
+            print(f"Seguimiento {ya + 1} para {remitente} omitido: falta "
+                  f"PLANTILLA_SEGUIMIENTO (Meta no deja mensajes libres fuera "
+                  f"de la ventana de 24 h).")
+            est["enviados"] = MAX_SEGUIMIENTOS
+            continue
+
+        if resultado == "error":
+            # Reintenta en el siguiente ping, pero no eternamente: un token
+            # vencido no se va a arreglar solo y no queremos el log lleno.
+            est["intentos"] = est.get("intentos", 0) + 1
+            if est["intentos"] >= 3:
+                print(f"Seguimiento {ya + 1} para {remitente} abandonado "
+                      f"despues de 3 intentos fallidos.")
+                est["enviados"] = MAX_SEGUIMIENTOS
+            continue
+
+        est["enviados"] = ya + 1
+        est["ultimo_envio"] = _iso(ahora)
+        est["intentos"] = 0
+        mandados += 1
+        # Se le deja la nota al modelo para que si la persona contesta,
+        # Valentina sepa que ya le escribio y no arranque de cero.
+        historiales.setdefault(remitente, []).append({
+            "role": "assistant",
+            "content": f"[Seguimiento {ya + 1} de {MAX_SEGUIMIENTOS} enviado: "
+                       f"se le recordo la llamada con {ASESOR_NOMBRE}]",
+        })
+
+    if cambio:
+        guardar_seguimientos()
+    return mandados
+
+
+cargar_seguimientos()
+
+
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot de WhatsApp (Meta Cloud API) — Valentina activa. Prompt V8."
+    # UptimeRobot pega aqui cada 5 min para que Render no se duerma; de paso
+    # aprovechamos ese latido como reloj de los seguimientos. Es idempotente:
+    # solo manda lo que ya cumplio su espera y lo marca enseguida.
+    try:
+        mandados = revisar_seguimientos()
+    except Exception as e:
+        print("Error revisando seguimientos:", e)
+        mandados = 0
+    return (f"Bot de WhatsApp (Meta Cloud API) — Valentina activa. Prompt V9. "
+            f"Seguimientos enviados en este ping: {mandados}.")
+
+
+@app.route("/cron/seguimientos", methods=["GET", "POST"])
+def cron_seguimientos():
+    """Mismo trabajo que el ping de la home, por si algun dia se quiere un
+    despertador aparte (Render Cron, cron-job.org) sin tocar la home."""
+    return {"enviados": revisar_seguimientos()}, 200
 
 
 if __name__ == "__main__":
