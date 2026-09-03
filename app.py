@@ -184,6 +184,17 @@ CALCOM_EVENT_TYPE_ID = os.environ.get("CALCOM_EVENT_TYPE_ID", "6525721")
 CALCOM_TIMEZONE = os.environ.get("CALCOM_TIMEZONE", "America/Merida")
 CALCOM_BASE = "https://api.cal.com/v2"
 
+# Correo base con el que se agendan las citas. A la persona NUNCA se le pide
+# el suyo (pedirlo costaba conversiones), pero Cal.com exige uno, asi que se
+# arma uno por prospecto con "sub-direccion": buzon+wa529991105167@gmail.com.
+# Tiene que ser una cuenta REAL que pueda recibir correo, del asesor o de la
+# casa: Cal.com valida el dominio y rechaza los que no reciben mail
+# (`email_domain_cannot_receive_mail`). Gmail, Outlook y Google Workspace
+# soportan el "+" y entregan todo al mismo buzon, asi que el asesor recibe la
+# copia de confirmacion y nadie ajeno ve los datos del prospecto.
+CORREO_BASE_CITAS = os.environ.get("CORREO_BASE_CITAS",
+                                   "enrique.ampudia97@gmail.com")
+
 # ---------------------------------------------------------------------------
 # SEGUIMIENTOS — reenganchar a quien no agendo
 # ---------------------------------------------------------------------------
@@ -1020,11 +1031,20 @@ def correo_de_whatsapp(telefono):
     ya la tenemos por WhatsApp y pedirlo costaba conversiones. Se arma uno
     derivado del numero, siempre el mismo, que ademas sirve para volver a
     encontrar sus citas en la API si se pierde el estado en memoria.
-    Se usa `example.com` porque esta reservado por la IANA (nadie puede ser
-    dueno de el, no hay riesgo de mandarle los datos a un extrano) y porque
-    Cal.com rechaza los dominios que no pueden recibir correo: dominios
-    inventados o `.invalid` truenan con `email_domain_cannot_receive_mail`."""
-    return f"wa{re.sub(r'\\D', '', telefono or '')}@example.com"
+
+    OJO (2026-09-03): antes se usaba `wa<numero>@example.com`. Dejo de servir:
+    example.com publica un MX nulo (RFC 7505), o sea que no puede recibir
+    correo, y Cal.com empezo a rechazarlo con `email_domain_cannot_receive_mail`
+    igual que a los dominios `.invalid`. Con eso NINGUNA cita se agendaba: el
+    POST tronaba con 400 y la persona veia "ese horario se acaba de ocupar"
+    para cualquier hora que tocara. Ahora se usa una sub-direccion del correo
+    real del asesor (CORREO_BASE_CITAS), que si recibe mail, sigue siendo
+    distinta por prospecto y no expone los datos a nadie de fuera."""
+    digitos = re.sub(r"[^0-9]", "", telefono or "")
+    buzon, _, dominio = CORREO_BASE_CITAS.partition("@")
+    # Si el buzon ya traia un "+algo" se ignora, para no encadenar etiquetas.
+    buzon = buzon.split("+")[0]
+    return f"{buzon}+wa{digitos}@{dominio}"
 
 
 def crear_reserva_calcom(start_iso, nombre, correo, telefono):
@@ -1075,12 +1095,34 @@ def agendar(remitente, start_iso, nombre):
 
     if not ok:
         print("Error creando reserva en Cal.com:", detalle)
+        # Antes CUALQUIER error se le contaba como "se ocupo el horario" y se
+        # le volvia a mandar la lista. Si la falla no era del horario sino de
+        # la peticion (pasaba con el correo invalido), la persona quedaba en un
+        # bucle: elegia hora -> "se ocupo" -> lista -> elegia hora... sin salida
+        # y sin que nadie se enterara. Solo se reintenta si de verdad se ocupo.
+        texto = (detalle or "").lower()
+        se_ocupo = any(p in texto for p in (
+            "no_available_users", "already", "no longer available",
+            "not available", "booking_seats_full", "slot", "conflict"))
+        if se_ocupo:
+            enviar_whatsapp(remitente,
+                "Uy, ese horario se acaba de ocupar 🙈 Estos son los dias que "
+                "siguen libres:")
+            # Sin resetear los descartes: sigue siendo el mismo intento y los
+            # dias que ya rechazo le siguen sin servir.
+            mandar_lista_dias(remitente, 0)
+            return
+        # Falla tecnica: no se le vuelve a ofrecer la lista (tronaria igual).
+        # Se le avisa de frente y se pasa a manos del asesor.
         enviar_whatsapp(remitente,
-            "Uy, ese horario se acaba de ocupar 🙈 Estos son los dias que "
-            "siguen libres:")
-        # Sin resetear los descartes: sigue siendo el mismo intento y los
-        # dias que ya rechazo le siguen sin servir.
-        mandar_lista_dias(remitente, 0)
+            f"Se me trabo el sistema al confirmar la cita 🙈 Ya le avise a "
+            f"{ASESOR_CORTO} y el te contacta por aqui mismo para cerrarla. "
+            f"Mil disculpas!")
+        historiales.setdefault(remitente, []).append({
+            "role": "assistant",
+            "content": "[Fallo tecnico al agendar: no volver a ofrecer "
+                       "horarios, el asesor lo contacta]",
+        })
         return
 
     dias_descartados.pop(remitente, None)
