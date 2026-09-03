@@ -42,7 +42,7 @@ import unicodedata
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from flask import Flask, request
+from flask import Flask, request, Response
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
@@ -300,6 +300,26 @@ PLANTILLA_BOTON_STOP = os.environ.get("PLANTILLA_BOTON_STOP", "Ya no me escribas
 UPSTASH_URL = os.environ.get("UPSTASH_URL", "").strip().rstrip("/")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN", "").strip()
 CLAVE_NO_MOLESTAR = os.environ.get("CLAVE_NO_MOLESTAR", "no_molestar").strip()
+
+# --- ARCHIVO DE CONVERSACIONES (2026-09-03) -------------------------------
+# Las conversaciones vivian SOLO en memoria (`historiales`), o sea que cada
+# redeploy de Render las borraba y no quedaba nada que leer despues. Ahora cada
+# conversacion se guarda tambien en Upstash, en la MISMA cuenta que la lista de
+# no-molestar pero con claves aparte, para poder releerlas, clasificarlas y
+# usarlas de retroalimentacion.
+#
+# Una clave por persona: "conv:5219991105167" -> un JSON con sus datos y todos
+# sus mensajes con hora. Y un indice ("conversaciones") con los numeros que
+# existen, para poder exportarlas todas sin usar SCAN.
+#
+# OJO: esto NO toca nada de no-molestar. Son claves distintas y funciones
+# distintas a proposito; esa parte quedo exactamente igual.
+PREFIJO_CONVERSACION = os.environ.get("PREFIJO_CONVERSACION", "conv:").strip()
+CLAVE_INDICE_CONVERSACIONES = os.environ.get(
+    "CLAVE_INDICE_CONVERSACIONES", "conversaciones").strip()
+# Contrasena para bajar el archivo desde /exportar. Si se deja vacia, el
+# endpoint queda APAGADO: son datos personales, no pueden quedar al aire.
+CLAVE_EXPORT = os.environ.get("CLAVE_EXPORT", "").strip()
 
 # Redes sociales de {ASESOR}: van en el primer seguimiento para que la persona
 # pueda ver quien es antes de decidir. Es la unica parte del bot donde salen
@@ -593,6 +613,10 @@ def recibir():
             respuesta = (interactivo.get("list_reply")
                          or interactivo.get("button_reply") or {})
             id_boton = respuesta.get("id", "")
+            # Lo que toco cuenta como algo que dijo: sin esto el expediente
+            # tendria huecos justo en la parte que mas importa (el agendado).
+            registrar_en_archivo(remitente, "prospecto",
+                                 respuesta.get("title") or id_boton)
             if id_boton == "no_seguimiento":
                 detener_seguimientos(remitente)
             elif id_boton == "ver_horarios":
@@ -604,6 +628,7 @@ def recibir():
             return "ok", 200
 
         texto = msg.get("text", {}).get("body", "")   # el texto que escribio
+        registrar_en_archivo(remitente, "prospecto", texto)
 
         # Caso 1.5: pidio por ESCRITO que ya no le escriban. Tiene que atajarse
         # aqui, antes del modelo: mas arriba registrar_mensaje_entrante() ya le
@@ -706,6 +731,10 @@ def enviar_whatsapp(destino, texto):
     if not texto:
         print("Se intento enviar un mensaje vacio a WhatsApp. Cancelado.")
         return
+    # Un solo punto de captura para TODO lo que sale por aqui (respuestas del
+    # modelo, avisos del sistema y seguimientos): asi no hay que acordarse de
+    # archivar en cada sitio que manda un mensaje.
+    registrar_en_archivo(destino, "valentina", texto)
     _post_whatsapp({
         "messaging_product": "whatsapp",
         "to": destino,
@@ -1047,16 +1076,95 @@ def correo_de_whatsapp(telefono):
     return f"{buzon}+wa{digitos}@{dominio}"
 
 
-def crear_reserva_calcom(start_iso, nombre, correo, telefono):
+# Cuanta conversacion cruda se pega en la descripcion del evento. Google
+# Calendar aguanta ~8 KB ahi; con 3500 caracteres cabe una conversacion
+# completa de Valentina y no hay riesgo de que Cal.com la recorte.
+LIMITE_TRANSCRIPCION = 3500
+
+PROMPT_RESUMEN_CITA = """Preparas la ficha de un prospecto para que un asesor de
+seguros la lea en 10 segundos antes de llamarlo. Te doy su conversacion de
+WhatsApp. Devuelve SOLO estos campos, uno por linea, sin introduccion:
+
+Nombre:
+Edad:
+Dependientes:
+Ocupacion:
+Necesita al mes:
+Proteccion actual:
+Objeciones o dudas:
+Por donde ir:
+
+Reglas estrictas:
+- Usa UNICAMENTE lo que la persona dijo. Si un dato no aparece, escribe "no lo dijo".
+- Prohibido inventar, deducir o rellenar. Un campo vacio es mejor que uno inventado.
+- Cada campo en una sola linea, corto y concreto.
+- "Por donde ir" es una frase con lo que mas le importo a la persona."""
+
+
+def resumen_para_calendario(remitente):
+    """Arma lo que el asesor leera en la descripcion del evento: una ficha con
+    los datos que dio el prospecto, mas la conversacion tal cual.
+
+    Importa mas de lo que parece: los historiales viven en memoria y se borran
+    en cada redeploy de Render, asi que el evento del calendario termina siendo
+    el UNICO lugar donde queda lo que la persona conto. Si el resumen falla se
+    manda la conversacion cruda igual: perder la ficha es molesto, perder la
+    conversacion es perder todo el trabajo de Valentina."""
+    salto = chr(10)
+    historial = historiales.get(remitente) or []
+    lineas = []
+    for m in historial:
+        contenido = (m.get("content") or "").strip()
+        # Las marcas internas ([Cita agendada ...], [Seguimiento enviado: ...])
+        # son recados para el modelo, no las dijo nadie: fuera de la ficha.
+        if not contenido or contenido.startswith("["):
+            continue
+        quien = "Prospecto" if m.get("role") == "user" else "Valentina"
+        lineas.append(f"{quien}: {contenido}")
+
+    if not lineas:
+        return "", ""
+
+    transcripcion = salto.join(lineas)
+    if len(transcripcion) > LIMITE_TRANSCRIPCION:
+        # Se recorta por el principio: lo ultimo que hablaron es lo que le
+        # sirve al asesor para arrancar la llamada.
+        transcripcion = ("...(inicio recortado)" + salto
+                         + transcripcion[-LIMITE_TRANSCRIPCION:])
+
+    resumen = ""
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=400,
+            messages=[{"role": "system", "content": PROMPT_RESUMEN_CITA},
+                      {"role": "user", "content": transcripcion}],
+            extra_body={"reasoning_effort": "low"},
+        )
+        resumen = (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        # Nunca debe tumbar la reserva: la cita vale mas que la ficha.
+        print("No se pudo resumir la conversacion para el calendario:", e)
+
+    return resumen, transcripcion
+
+
+def crear_reserva_calcom(start_iso, nombre, correo, telefono,
+                         resumen="", transcripcion=""):
     dt = datetime.fromisoformat(start_iso)
     start_utc = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     telefono_e164 = normalizar_telefono(telefono)
     wa_id = re.sub(r"\D", "", telefono or "")
     # Estas notas son lo que ve el asesor en su Google Calendar y en el correo
     # de confirmacion: el numero para llamar y el link directo al chat.
-    notas = (f"Prospecto de WhatsApp: {telefono_e164}\n"
-             f"Abrir el chat: https://wa.me/{wa_id}\n"
-             f"Agendado automaticamente por Valentina (bot).")
+    partes = [f"Prospecto de WhatsApp: {telefono_e164}",
+              f"Abrir el chat: https://wa.me/{wa_id}"]
+    if resumen:
+        partes += ["", "--- FICHA DEL PROSPECTO ---", resumen]
+    if transcripcion:
+        partes += ["", "--- CONVERSACION CON VALENTINA ---", transcripcion]
+    partes += ["", "Agendado automaticamente por Valentina (bot)."]
+    notas = chr(10).join(partes)
     payload = {
         "start": start_utc,
         "eventTypeId": int(CALCOM_EVENT_TYPE_ID),
@@ -1088,8 +1196,12 @@ def crear_reserva_calcom(start_iso, nombre, correo, telefono):
 def agendar(remitente, start_iso, nombre):
     """Cierra la cita en cuanto toca el horario: no se le pide ningun dato
     mas, todo lo que Cal.com necesita ya lo tenemos de WhatsApp."""
+    # Se arma ANTES de reservar: si el resumen truena, truena aqui y no
+    # despues de haberle dicho a la persona que su cita ya quedo.
+    resumen, transcripcion = resumen_para_calendario(remitente)
     ok, uid, detalle = crear_reserva_calcom(
-        start_iso, nombre, correo_de_whatsapp(remitente), remitente)
+        start_iso, nombre, correo_de_whatsapp(remitente), remitente,
+        resumen, transcripcion)
 
     horarios_mostrados.pop(remitente, None)
 
@@ -1303,6 +1415,93 @@ def agregar_no_molestar(remitente, motivo):
         # Que falle Upstash no debe tumbar la conversacion. Queda apagado en
         # memoria; lo que se pierde es que aguante el proximo deploy.
         print(f"No se pudo guardar {remitente} en Upstash ({motivo}):", e)
+
+
+# ---------------------------------------------------------------------------
+# 5b) ARCHIVO DE CONVERSACIONES — para releerlas y aprender de ellas
+# ---------------------------------------------------------------------------
+# Nada de aqui puede tumbar una conversacion: si Upstash falla, se registra en
+# memoria y se sigue. Perder el archivo es molesto; perder al prospecto no.
+
+# Copia en memoria del archivo. {telefono: {...}}
+conversaciones = {}
+
+
+def _clasificar(remitente):
+    """La etiqueta con la que se guarda la conversacion. Se calcula al vuelo
+    LEYENDO el estado que ya existe: no se toca ni se duplica nada, sobre todo
+    nada de no-molestar."""
+    if remitente in no_molestar:
+        return "no_molestar"
+    if citas_agendadas.get(remitente):
+        return "agendado"
+    est = seguimientos.get(remitente) or {}
+    if est.get("detenido"):
+        return "no_molestar"
+    if est.get("enviados", 0) > 0:
+        return "sin_respuesta"      # se le mando el seguimiento y no volvio
+    return "en_conversacion"
+
+
+def registrar_en_archivo(remitente, de, texto):
+    """Agrega un mensaje al expediente de esa persona y lo sube a Upstash.
+
+    `de` es "prospecto", "valentina" o "sistema" (las marcas internas tipo
+    "[Cita agendada ...]": se guardan porque cuentan que paso, y se distinguen
+    para poder filtrarlas despues)."""
+    texto = (texto or "").strip()
+    if not texto:
+        return
+
+    ahora = _ahora().isoformat()
+    exp = conversaciones.setdefault(remitente, {
+        "telefono": remitente,
+        "primer_mensaje": ahora,
+        "mensajes": [],
+    })
+    exp["mensajes"].append({"t": ahora, "de": de, "texto": texto})
+    exp["ultimo_mensaje"] = ahora
+    exp["estado"] = _clasificar(remitente)
+    exp["total_mensajes"] = len(exp["mensajes"])
+
+    cita = citas_agendadas.get(remitente)
+    if cita:
+        exp["cita"] = cita.get("start")
+
+    # El nombre es lo primero que se busca al revisar: se deja a mano en vez de
+    # obligar a leer la conversacion entera.
+    if de == "prospecto" and not exp.get("nombre") and len(exp["mensajes"]) <= 4:
+        posible = texto.strip()
+        if 1 < len(posible) <= 30 and " " not in posible.strip():
+            exp["nombre"] = posible
+
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        return
+    try:
+        _upstash(["SET", PREFIJO_CONVERSACION + remitente,
+                  json.dumps(exp, ensure_ascii=False)])
+        # SADD es idempotente: repetirlo no cuesta nada y evita llevar registro
+        # aparte de quien ya estaba en el indice.
+        _upstash(["SADD", CLAVE_INDICE_CONVERSACIONES, remitente])
+    except Exception as e:
+        print(f"No se pudo archivar la conversacion de {remitente}:", e)
+
+
+def leer_conversaciones_archivadas():
+    """Trae de Upstash todos los expedientes. Solo lo usa /exportar."""
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        return []
+    numeros = _upstash(["SMEMBERS", CLAVE_INDICE_CONVERSACIONES]) or []
+    salida = []
+    for numero in numeros:
+        try:
+            crudo = _upstash(["GET", PREFIJO_CONVERSACION + str(numero)])
+            if crudo:
+                salida.append(json.loads(crudo))
+        except Exception as e:
+            print(f"No se pudo leer el expediente de {numero}:", e)
+    salida.sort(key=lambda c: c.get("ultimo_mensaje") or "", reverse=True)
+    return salida
 
 
 def cargar_seguimientos():
@@ -1609,6 +1808,38 @@ def cron_seguimientos():
     """Mismo trabajo que el ping de la home, por si algun dia se quiere un
     despertador aparte (Render Cron, cron-job.org) sin tocar la home."""
     return {"enviados": revisar_seguimientos()}, 200
+
+
+@app.route("/exportar", methods=["GET"])
+def exportar_conversaciones():
+    """Baja TODAS las conversaciones archivadas en un JSON.
+
+    Se pide asi:  https://<tu-servicio>.onrender.com/exportar?clave=LA_CLAVE
+
+    Son datos personales de gente real, por eso pide contrasena y por eso el
+    endpoint no existe si no se configuro CLAVE_EXPORT en Render."""
+    if not CLAVE_EXPORT:
+        return {"error": "Exportar esta apagado: falta CLAVE_EXPORT en Render."}, 503
+    if request.args.get("clave", "") != CLAVE_EXPORT:
+        return {"error": "Clave incorrecta."}, 403
+
+    try:
+        datos = leer_conversaciones_archivadas()
+    except Exception as e:
+        print("Error exportando conversaciones:", e)
+        return {"error": "No se pudo leer el archivo."}, 500
+
+    cuerpo = json.dumps({
+        "generado": _ahora().isoformat(),
+        "total": len(datos),
+        "conversaciones": datos,
+    }, ensure_ascii=False, indent=2)
+    return Response(
+        cuerpo,
+        mimetype="application/json; charset=utf-8",
+        headers={"Content-Disposition":
+                 "attachment; filename=conversaciones_valentina.json"},
+    )
 
 
 if __name__ == "__main__":
