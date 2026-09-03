@@ -1149,6 +1149,43 @@ def resumen_para_calendario(remitente):
     return resumen, transcripcion
 
 
+# Cal.com corta el campo "notes" en 1000 caracteres EXACTOS y si te pasas
+# rechaza la reserva entera con `{notes}max_characters_allowed`. Medido contra
+# la API el 2026-09-03, no viene documentado. Pasarse tumbaba el agendado
+# completo, asi que esto se recorta SIEMPRE antes de mandarlo.
+LIMITE_NOTAS_CALCOM = 1000
+
+
+def _armar_notas(telefono_e164, wa_id, resumen, transcripcion):
+    """Arma la descripcion del evento cabiendo en el limite de Cal.com.
+
+    Orden de prioridad, porque no cabe todo: primero el telefono y el link al
+    chat (sin eso el asesor no puede ni llamar), luego la ficha (lo que le
+    sirve para preparar la llamada) y con lo que sobre, el final de la
+    conversacion. La conversacion COMPLETA no se pierde: vive en el archivo de
+    Upstash, que no tiene este limite."""
+    salto = chr(10)
+    partes = [f"Prospecto de WhatsApp: {telefono_e164}",
+              f"Abrir el chat: https://wa.me/{wa_id}"]
+    if resumen:
+        partes += ["", "--- FICHA DEL PROSPECTO ---", resumen]
+    notas = salto.join(partes)
+
+    if len(notas) > LIMITE_NOTAS_CALCOM:
+        return notas[:LIMITE_NOTAS_CALCOM - 3] + "..."
+
+    if transcripcion:
+        titulo = salto + salto + "--- ULTIMO DE LA CONVERSACION ---" + salto
+        espacio = LIMITE_NOTAS_CALCOM - len(notas) - len(titulo)
+        # Menos de 80 caracteres de conversacion no le dicen nada a nadie:
+        # mejor dejar la ficha limpia que pegar un pedazo suelto.
+        if espacio >= 80:
+            cola = transcripcion[-espacio:]
+            notas = notas + titulo + cola
+
+    return notas[:LIMITE_NOTAS_CALCOM]
+
+
 def crear_reserva_calcom(start_iso, nombre, correo, telefono,
                          resumen="", transcripcion=""):
     dt = datetime.fromisoformat(start_iso)
@@ -1157,40 +1194,69 @@ def crear_reserva_calcom(start_iso, nombre, correo, telefono,
     wa_id = re.sub(r"\D", "", telefono or "")
     # Estas notas son lo que ve el asesor en su Google Calendar y en el correo
     # de confirmacion: el numero para llamar y el link directo al chat.
-    partes = [f"Prospecto de WhatsApp: {telefono_e164}",
-              f"Abrir el chat: https://wa.me/{wa_id}"]
-    if resumen:
-        partes += ["", "--- FICHA DEL PROSPECTO ---", resumen]
-    if transcripcion:
-        partes += ["", "--- CONVERSACION CON VALENTINA ---", transcripcion]
-    partes += ["", "Agendado automaticamente por Valentina (bot)."]
-    notas = chr(10).join(partes)
-    payload = {
-        "start": start_utc,
-        "eventTypeId": int(CALCOM_EVENT_TYPE_ID),
-        "attendee": {
-            "name": nombre,
-            "email": correo,
-            "timeZone": CALCOM_TIMEZONE,
-            "phoneNumber": telefono_e164,
-        },
-        # attendeePhone = el asesor llama a ESTE numero. Cal.com lo pone solo
-        # como "ubicacion" de la cita, no hay que llenarlo a mano.
-        "location": {"type": "attendeePhone", "phone": telefono_e164},
-        "bookingFieldsResponses": {"notes": notas},
-        "metadata": {"whatsapp": wa_id[:50]},
-    }
-    r = requests.post(f"{CALCOM_BASE}/bookings",
-                       headers=_calcom_headers("2024-08-13"),
-                       json=payload, timeout=15)
-    if r.status_code >= 400:
-        return False, None, r.text
-    uid = None
-    try:
-        uid = r.json()["data"]["uid"]
-    except (ValueError, KeyError, TypeError):
-        pass                       # la cita quedo; solo no podremos cancelarla
-    return True, uid, r.text
+    #
+    # LA CITA VALE MAS QUE LA DESCRIPCION. Si Cal.com rechaza la reserva por
+    # algo de las notas (paso de verdad: el limite de 1000 caracteres tumbaba
+    # el agendado completo), se reintenta con menos y al final sin nada. Para
+    # el asesor, una cita sin ficha cuesta medio minuto de preparacion; una
+    # cita perdida cuesta el prospecto, y ademas la persona se queda pensando
+    # que el bot no sirve. Por eso se intenta en este orden:
+    #   1. ficha completa + lo ultimo de la conversacion
+    #   2. solo el telefono y el link al chat (lo minimo para poder llamar)
+    #   3. sin notas
+    intentos = [
+        _armar_notas(telefono_e164, wa_id, resumen, transcripcion),
+        _armar_notas(telefono_e164, wa_id, "", ""),
+        "",
+    ]
+
+    ultimo_detalle = ""
+    for numero, notas in enumerate(intentos, start=1):
+        payload = {
+            "start": start_utc,
+            "eventTypeId": int(CALCOM_EVENT_TYPE_ID),
+            "attendee": {
+                "name": nombre,
+                "email": correo,
+                "timeZone": CALCOM_TIMEZONE,
+                "phoneNumber": telefono_e164,
+            },
+            # attendeePhone = el asesor llama a ESTE numero. Cal.com lo pone
+            # solo como "ubicacion" de la cita, no hay que llenarlo a mano.
+            "location": {"type": "attendeePhone", "phone": telefono_e164},
+            "metadata": {"whatsapp": wa_id[:50]},
+        }
+        if notas:
+            payload["bookingFieldsResponses"] = {"notes": notas}
+
+        try:
+            r = requests.post(f"{CALCOM_BASE}/bookings",
+                              headers=_calcom_headers("2024-08-13"),
+                              json=payload, timeout=15)
+        except Exception as e:
+            # Un timeout o un corte de red tampoco deben costar la cita.
+            ultimo_detalle = f"excepcion de red: {e}"
+            print(f"Intento {numero} de reservar fallo por red:", e)
+            continue
+
+        if r.status_code < 400:
+            if numero > 1:
+                print(f"Cita agendada en el intento {numero} (con menos "
+                      f"descripcion). Motivo del fallo anterior: "
+                      f"{ultimo_detalle[:300]}")
+            uid = None
+            try:
+                uid = r.json()["data"]["uid"]
+            except (ValueError, KeyError, TypeError):
+                pass               # la cita quedo; solo no podremos cancelarla
+            return True, uid, r.text
+
+        ultimo_detalle = r.text
+        print(f"Intento {numero} de reservar rechazado por Cal.com:",
+              r.text[:300])
+
+    # Ni siquiera pelada funciono: el problema no eran las notas.
+    return False, None, ultimo_detalle
 
 
 def agendar(remitente, start_iso, nombre):
